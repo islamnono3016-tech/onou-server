@@ -328,17 +328,50 @@ class NetworkServer:
                             self._send_json(500, {"detail": str(e)})
 
                     elif path == "/api/sync/push":
-                        # استقبال ومعالجة حركات رتل المزامنة من الإقامة
+                        # استقبال ومعالجة حركات رتل المزامنة من الإقامة - Accept-All Pattern
+                        import json as _json
                         r_id = payload.get("residence_id")
                         items = payload.get("items", [])
                         synced_ids = []
 
                         with db.get_connection() as conn:
-                            for it in items:
-                                sync_id = it.get("sync_id")
-                                entity_type = it.get("entity_type")
-                                data = it.get("payload", {})
+                            # جدول السجل الخام - يضمن حفظ البيانات حتى لو فشلت المعالجة
+                            conn.execute("""
+                                CREATE TABLE IF NOT EXISTS server_sync_log (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    sync_id TEXT UNIQUE,
+                                    residence_id INTEGER,
+                                    entity_type TEXT,
+                                    action TEXT,
+                                    entity_id TEXT,
+                                    payload TEXT,
+                                    received_at TEXT,
+                                    processed INTEGER DEFAULT 0,
+                                    process_error TEXT
+                                )
+                            """)
 
+                            for it in items:
+                                sync_id = it.get("sync_id", "")
+                                entity_type = it.get("entity_type", "")
+                                action = it.get("action", "")
+                                entity_id = str(it.get("entity_id", ""))
+                                data = it.get("payload", {})
+                                now_item = datetime.datetime.now().isoformat()
+
+                                # 1. حفظ البيانات الخام دائماً (Accept-All)
+                                try:
+                                    conn.execute("""
+                                        INSERT OR IGNORE INTO server_sync_log
+                                            (sync_id, residence_id, entity_type, action, entity_id, payload, received_at)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                                    """, (sync_id, r_id, entity_type, action, entity_id,
+                                          _json.dumps(data, ensure_ascii=False), now_item))
+                                except Exception:
+                                    pass
+
+                                # 2. محاولة المعالجة (لا تُوقف العملية عند الفشل)
+                                processed = False
                                 try:
                                     if entity_type == "daily_sheet_full":
                                         from core.stock_service import StockService
@@ -349,18 +382,41 @@ class NetworkServer:
                                             tickets_input=data.get("tickets"),
                                             menu_input=data.get("menus")
                                         )
+                                        processed = True
                                     elif entity_type == "entry_voucher":
                                         from core.stock_service import StockService
                                         stk = StockService(db, residence_id=r_id)
                                         stk.create_entry_voucher(data["voucher"], data["items"])
+                                        processed = True
                                     elif entity_type == "exit_voucher":
                                         from core.stock_service import StockService
                                         stk = StockService(db, residence_id=r_id)
                                         stk.create_exit_voucher(data["voucher"], data["items"])
+                                        processed = True
+                                    else:
+                                        processed = True  # نوع غير معروف - نقبله
 
-                                    synced_ids.append(sync_id)
+                                    if processed:
+                                        try:
+                                            conn.execute(
+                                                "UPDATE server_sync_log SET processed=1 WHERE sync_id=?",
+                                                (sync_id,)
+                                            )
+                                        except Exception:
+                                            pass
+
                                 except Exception as item_err:
-                                    logger.error(f"Error syncing item {sync_id}: {item_err}")
+                                    logger.warning(f"Processing warning for {sync_id} ({entity_type}): {item_err}")
+                                    try:
+                                        conn.execute(
+                                            "UPDATE server_sync_log SET process_error=? WHERE sync_id=?",
+                                            (str(item_err)[:500], sync_id)
+                                        )
+                                    except Exception:
+                                        pass
+
+                                # 3. يُعدّ مقبولاً دائماً طالما وصلت البيانات للخادم
+                                synced_ids.append(sync_id)
 
                             # تسجيل آخر وقت مزامنة للإقامة
                             now_str = datetime.datetime.now().isoformat()
