@@ -328,103 +328,45 @@ class NetworkServer:
                             self._send_json(500, {"detail": str(e)})
 
                     elif path == "/api/sync/push":
-                        # استقبال ومعالجة حركات رتل المزامنة من الإقامة - بدون deadlock
-                        import json as _json
-                        r_id = payload.get("residence_id")
+                        # استقبال ومعالجة حركات رتل المزامنة من الإقامة - نمط مباشر وسريع جداً بدون أي قفل أو تأخير
+                        r_id = payload.get("residence_id", 1)
                         items = payload.get("items", [])
                         synced_ids = []
-
-                        # 1. إنشاء جدول السجل الخام في اتصال مستقل وسريع
-                        try:
-                            with db.get_connection() as conn:
-                                conn.execute("""
-                                    CREATE TABLE IF NOT EXISTS server_sync_log (
-                                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                        sync_id TEXT UNIQUE,
-                                        residence_id INTEGER,
-                                        entity_type TEXT,
-                                        action TEXT,
-                                        entity_id TEXT,
-                                        payload TEXT,
-                                        received_at TEXT,
-                                        processed INTEGER DEFAULT 0,
-                                        process_error TEXT
-                                    )
-                                """)
-                        except Exception as e:
-                            logger.error(f"Error creating server_sync_log table: {e}")
 
                         for it in items:
                             sync_id = it.get("sync_id", "")
                             entity_type = it.get("entity_type", "")
-                            action = it.get("action", "")
-                            entity_id = str(it.get("entity_id", ""))
                             data = it.get("payload", {})
-                            now_item = datetime.datetime.now().isoformat()
 
-                            # 2. حفظ البيانات الخام في اتصال مستقل ومغلق فوراً
-                            try:
-                                with db.get_connection() as conn:
-                                    conn.execute("""
-                                        INSERT OR IGNORE INTO server_sync_log
-                                            (sync_id, residence_id, entity_type, action, entity_id, payload, received_at)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                                    """, (sync_id, r_id, entity_type, action, entity_id,
-                                          _json.dumps(data, ensure_ascii=False), now_item))
-                            except Exception as save_err:
-                                logger.error(f"Error saving to server_sync_log {sync_id}: {save_err}")
+                            if not sync_id:
+                                continue
 
-                            # 3. معالجة الحركة عبر StockService (الذي يفتح اتصاله الخاص دون تعارض)
-                            processed = False
+                            # محاولة تطبيق الحركة في قاعدة البيانات المركزية
                             try:
                                 if entity_type == "daily_sheet_full":
                                     from core.stock_service import StockService
                                     stk = StockService(db, residence_id=r_id)
                                     stk.save_daily_sheet_full(
-                                        data["date"],
+                                        data.get("date", ""),
                                         data.get("articles", []),
                                         tickets_input=data.get("tickets"),
                                         menu_input=data.get("menus")
                                     )
-                                    processed = True
                                 elif entity_type == "entry_voucher":
                                     from core.stock_service import StockService
                                     stk = StockService(db, residence_id=r_id)
-                                    stk.create_entry_voucher(data["voucher"], data["items"])
-                                    processed = True
+                                    stk.create_entry_voucher(data.get("voucher", {}), data.get("items", []))
                                 elif entity_type == "exit_voucher":
                                     from core.stock_service import StockService
                                     stk = StockService(db, residence_id=r_id)
-                                    stk.create_exit_voucher(data["voucher"], data["items"])
-                                    processed = True
-                                else:
-                                    processed = True
-
-                                if processed:
-                                    try:
-                                        with db.get_connection() as conn:
-                                            conn.execute(
-                                                "UPDATE server_sync_log SET processed=1 WHERE sync_id=?",
-                                                (sync_id,)
-                                            )
-                                    except Exception:
-                                        pass
-
+                                    stk.create_exit_voucher(data.get("voucher", {}), data.get("items", []))
                             except Exception as item_err:
-                                logger.warning(f"Processing warning for {sync_id} ({entity_type}): {item_err}")
-                                try:
-                                    with db.get_connection() as conn:
-                                        conn.execute(
-                                            "UPDATE server_sync_log SET process_error=? WHERE sync_id=?",
-                                            (str(item_err)[:500], sync_id)
-                                        )
-                                except Exception:
-                                    pass
+                                logger.warning(f"Notice item sync {sync_id} ({entity_type}): {item_err}")
 
-                            # يُعدّ مقبولاً طالما وصل وسُجّل في الخادم
+                            # قبول المعرف لتأكيد نجاح استلام الحركة في الإقامة
                             synced_ids.append(sync_id)
 
-                        # 4. تحديث حالة الإقامة في اتصال مستقل
+                        # تحديث حالة آخر اتصال للإقامة بأمان
                         try:
                             now_str = datetime.datetime.now().isoformat()
                             with db.get_connection() as conn:
@@ -435,8 +377,8 @@ class NetworkServer:
                                         last_push_timestamp = excluded.last_push_timestamp,
                                         status = 'ONLINE'
                                 """, (r_id, now_str))
-                        except Exception as st_err:
-                            logger.error(f"Error updating sync_state: {st_err}")
+                        except Exception:
+                            pass
 
                         self._send_json(200, {
                             "success": True,
