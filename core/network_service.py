@@ -289,6 +289,89 @@ class NetworkServer:
                     else:
                         self._send_json(404, {"error": "No update package available on server"})
 
+                elif path == "/api/sync/pull":
+                    # سحب الحركات المسجلة من الحواسيب الأخرى
+                    since_id = int(query_params.get("since_id", 0))
+                    limit = min(int(query_params.get("limit", 200)), 500)
+                    res_filter = query_params.get("residence_id")
+
+                    query = "SELECT id, sync_id, residence_id, entity_type, action, entity_id, payload, created_at FROM sync_events WHERE id > ?"
+                    params = [since_id]
+                    if res_filter and str(res_filter).strip() not in ("", "0", "None"):
+                        query += " AND residence_id = ?"
+                        params.append(int(res_filter))
+                    query += " ORDER BY id ASC LIMIT ?"
+                    params.append(limit)
+
+                    with db.get_connection() as conn:
+                        try:
+                            conn.execute("""
+                                CREATE TABLE IF NOT EXISTS sync_events (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    sync_id TEXT UNIQUE,
+                                    residence_id INTEGER,
+                                    entity_type TEXT,
+                                    action TEXT,
+                                    entity_id TEXT,
+                                    payload TEXT,
+                                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                );
+                            """)
+                            cur = conn.execute(query, tuple(params))
+                            events = []
+                            max_id = since_id
+                            for r in cur.fetchall():
+                                row_dict = dict(r)
+                                try:
+                                    row_dict["payload"] = json.loads(row_dict["payload"])
+                                except Exception:
+                                    pass
+                                events.append(row_dict)
+                                if row_dict["id"] > max_id:
+                                    max_id = row_dict["id"]
+
+                            self._send_json(200, {
+                                "success": True,
+                                "events": events,
+                                "count": len(events),
+                                "latest_id": max_id
+                            })
+                        except Exception as e:
+                            self._send_json(500, {"error": f"Pull failed: {e}"})
+
+                elif path == "/api/sync/full_export":
+                    # تصدير شامل لكافة البيانات لمزامنة الحواسيب الجديدة فورياً
+                    try:
+                        with db.get_connection() as conn:
+                            cur = conn.execute("SELECT * FROM daily_meals_tracking ORDER BY date ASC")
+                            cols = [c[0] for c in cur.description] if cur.description else []
+                            meals = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                            cur = conn.execute("SELECT * FROM entry_vouchers ORDER BY date ASC")
+                            cols = [c[0] for c in cur.description] if cur.description else []
+                            entry_vouchers = [dict(zip(cols, r)) for r in cur.fetchall()]
+                            for ev in entry_vouchers:
+                                cur_it = conn.execute("SELECT * FROM entry_voucher_items WHERE voucher_id = ?", (ev["id"],))
+                                it_cols = [c[0] for c in cur_it.description] if cur_it.description else []
+                                ev["items"] = [dict(zip(it_cols, r)) for r in cur_it.fetchall()]
+
+                            cur = conn.execute("SELECT * FROM exit_vouchers ORDER BY date ASC")
+                            cols = [c[0] for c in cur.description] if cur.description else []
+                            exit_vouchers = [dict(zip(cols, r)) for r in cur.fetchall()]
+                            for ev in exit_vouchers:
+                                cur_it = conn.execute("SELECT * FROM exit_voucher_items WHERE voucher_id = ?", (ev["id"],))
+                                it_cols = [c[0] for c in cur_it.description] if cur_it.description else []
+                                ev["items"] = [dict(zip(it_cols, r)) for r in cur_it.fetchall()]
+
+                            self._send_json(200, {
+                                "success": True,
+                                "daily_meals": meals,
+                                "entry_vouchers": entry_vouchers,
+                                "exit_vouchers": exit_vouchers
+                            })
+                    except Exception as e:
+                        self._send_json(500, {"error": f"Full export failed: {e}"})
+
                 else:
                     self._send_json(404, {"error": "Endpoint Not Found"})
 
@@ -363,6 +446,35 @@ class NetworkServer:
                             except Exception as item_err:
                                 logger.warning(f"Notice item sync {sync_id} ({entity_type}): {item_err}")
 
+                            
+                            # تسجيل الحركة في سجل أحداث المزامنة لسحبها من الحواسيب الأخرى
+                            try:
+                                payload_str = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
+                                with db.get_connection() as conn:
+                                    conn.execute("""
+                                        CREATE TABLE IF NOT EXISTS sync_events (
+                                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                            sync_id TEXT UNIQUE,
+                                            residence_id INTEGER,
+                                            entity_type TEXT,
+                                            action TEXT,
+                                            entity_id TEXT,
+                                            payload TEXT,
+                                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                        );
+                                    """)
+                                    conn.execute("""
+                                        INSERT OR IGNORE INTO sync_events (sync_id, residence_id, entity_type, action, entity_id, payload, created_at)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                                    """, (
+                                        sync_id, r_id, entity_type, it.get("action", "SAVE"),
+                                        str(it.get("entity_id", "")), payload_str,
+                                        it.get("created_at", datetime.datetime.now().isoformat())
+                                    ))
+                                    conn.commit()
+                            except Exception as ev_err:
+                                logger.warning(f"Notice sync_event logging: {ev_err}")
+
                             # قبول المعرف لتأكيد نجاح استلام الحركة في الإقامة
                             synced_ids.append(sync_id)
 
@@ -384,6 +496,86 @@ class NetworkServer:
                             "success": True,
                             "synced_count": len(synced_ids),
                             "synced_ids": synced_ids
+                        })
+
+                    
+                    elif path == "/api/sync/full_import":
+                        # استيراد شامل وحفظ في سجل المزامنة المركزي
+                        imported_count = 0
+                        daily_meals = payload.get("daily_meals", [])
+                        entry_vouchers = payload.get("entry_vouchers", [])
+                        exit_vouchers = payload.get("exit_vouchers", [])
+
+                        from core.stock_service import StockService
+                        with db.get_connection() as conn:
+                            conn.execute("""
+                                CREATE TABLE IF NOT EXISTS sync_events (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    sync_id TEXT UNIQUE,
+                                    residence_id INTEGER,
+                                    entity_type TEXT,
+                                    action TEXT,
+                                    entity_id TEXT,
+                                    payload TEXT,
+                                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                );
+                            """)
+                            conn.commit()
+
+                        # استيراد أوراق الاستهلاك والوجبات
+                        for dm in daily_meals:
+                            r_id = dm.get("residence_id", 1)
+                            d_str = dm.get("date", "")
+                            s_id = f"dm_{r_id}_{d_str}"
+                            p_str = json.dumps({"date": d_str, "tickets": dm}, ensure_ascii=False)
+                            try:
+                                with db.get_connection() as conn:
+                                    conn.execute("""
+                                        INSERT OR IGNORE INTO sync_events (sync_id, residence_id, entity_type, action, entity_id, payload)
+                                        VALUES (?, ?, 'daily_sheet_full', 'UPSERT', ?, ?)
+                                    """, (s_id, r_id, d_str, p_str))
+                                    conn.commit()
+                                imported_count += 1
+                            except Exception:
+                                pass
+
+                        # استيراد وصولات الاستلام
+                        for ev in entry_vouchers:
+                            r_id = ev.get("residence_id", 1)
+                            v_id = ev.get("id", "")
+                            s_id = f"ev_entry_{r_id}_{v_id}"
+                            p_str = json.dumps({"voucher": ev, "items": ev.get("items", [])}, ensure_ascii=False)
+                            try:
+                                with db.get_connection() as conn:
+                                    conn.execute("""
+                                        INSERT OR IGNORE INTO sync_events (sync_id, residence_id, entity_type, action, entity_id, payload)
+                                        VALUES (?, ?, 'entry_voucher', 'CREATE', ?, ?)
+                                    """, (s_id, r_id, str(v_id), p_str))
+                                    conn.commit()
+                                imported_count += 1
+                            except Exception:
+                                pass
+
+                        # استيراد وصولات الإخراج
+                        for ev in exit_vouchers:
+                            r_id = ev.get("residence_id", 1)
+                            v_id = ev.get("id", "")
+                            s_id = f"ev_exit_{r_id}_{v_id}"
+                            p_str = json.dumps({"voucher": ev, "items": ev.get("items", [])}, ensure_ascii=False)
+                            try:
+                                with db.get_connection() as conn:
+                                    conn.execute("""
+                                        INSERT OR IGNORE INTO sync_events (sync_id, residence_id, entity_type, action, entity_id, payload)
+                                        VALUES (?, ?, 'exit_voucher', 'CREATE', ?, ?)
+                                    """, (s_id, r_id, str(v_id), p_str))
+                                    conn.commit()
+                                imported_count += 1
+                            except Exception:
+                                pass
+
+                        self._send_json(200, {
+                            "success": True,
+                            "imported_count": imported_count
                         })
 
                     else:
