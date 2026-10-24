@@ -31,6 +31,108 @@ def get_local_ip() -> str:
         s.close()
     return ip
 
+
+def normalize_server_url(server_host: Optional[str] = None, port: Optional[int] = None) -> str:
+    """تنسيق وتوليد رابط الخادم بشكل ذكي يدعم السيرفرات السحابية والروابط المباشرة والـ IPs المحلية"""
+    raw = (server_host or "127.0.0.1").strip()
+    if not raw:
+        raw = "127.0.0.1"
+    p = port or 8050
+
+    if "onrender.com" in raw.lower() or "render.com" in raw.lower():
+        if raw.startswith("http://"):
+            raw = "https://" + raw[7:]
+        elif not raw.startswith("https://"):
+            raw = f"https://{raw}"
+        import re
+        return re.sub(r":\d+$", "", raw.rstrip("/"))
+
+    if raw.startswith("https://"):
+        cleaned = raw.rstrip("/")
+        domain_part = cleaned.split("://", 1)[1]
+        if ":" in domain_part or p in (443, 8050):
+            return cleaned.split(":")[0] + "://" + domain_part.split(":")[0] if p in (443, 8050) and ":" in domain_part else cleaned
+        return f"{cleaned}:{p}"
+
+    if raw.startswith("http://"):
+        cleaned = raw.rstrip("/")
+        if ":" in cleaned.split("://", 1)[1]:
+            return cleaned
+        return f"{cleaned}:{p}"
+
+    if ":" in raw:
+        return f"http://{raw}"
+    if p == 443:
+        return f"https://{raw}"
+    return f"http://{raw}:{p}"
+
+
+def auto_seed_database(db: DatabaseManager):
+    """تهيئة وضمان وجود الإقامات والمستخدمين الرسميين وجدول المزامنة تلقائياً لجميع الحواسيب"""
+    try:
+        with db.get_connection() as conn:
+            # 1. جدول أحداث المزامنة
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sync_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sync_id TEXT UNIQUE,
+                    residence_id INTEGER,
+                    entity_type TEXT,
+                    action TEXT,
+                    entity_id TEXT,
+                    payload TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # 2. الإقامات السبع الرسمية
+            residences_data = [
+                (1, "RES-01", "الإقامة الجامعية بن الشيخ التلي", "ورقلة", "مدير الإقامة", 1000),
+                (2, "RES-02", "الإقامة الجامعية بن دحمان بشير", "ورقلة", "مدير الإقامة", 2000),
+                (3, "RES-03", "الإقامة الجامعية بن مالك محمد حسان", "ورقلة", "مدير الإقامة", 1000),
+                (4, "RES-04", "الإقامة الجامعية حساني محمد بن إبراهيم", "ورقلة", "مدير الإقامة", 1000),
+                (5, "RES-05", "الإقامة الجامعية قربشي محمد الناجي", "ورقلة", "مدير الإقامة", 1000),
+                (6, "RES-06", "الإقامة الجامعية لخضاري محمد الأخضر", "ورقلة", "مدير الإقامة", 1000),
+                (7, "RES-07", "الإقامة الجامعية محمد الطاهر العبيدي", "ورقلة", "مدير الإقامة", 1500),
+            ]
+            for rid, code, name, city, dname, cap in residences_data:
+                conn.execute("""
+                    INSERT INTO residences (id, code, name, city, director_name, capacity, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, 1)
+                    ON CONFLICT(id) DO UPDATE SET is_active=1, name=excluded.name, code=excluded.code;
+                """, (rid, code, name, city, dname, cap))
+
+            # 3. المستخدمون الرسميون لكافة الإقامات والمديرية
+            p_hash_123 = "pbkdf2$df2c0fad0cc882a1c7e1917bda568900bde268e625ffc0b621aa4f5551b4778e"
+            p_hash_admin = "pbkdf2$6474a3ce2ee9459d80d7639a9cb11ae410fc579178bf98f1bd0753aa8f47553b" # admin123
+            users_data = [
+                ("admin", p_hash_admin, "مدير الخدمات الجامعية (مسؤول النظام)", "SUPER_ADMIN", None),
+                ("user_cheikh", p_hash_123, "مسير مخزون إقامة بن الشيخ التلي", "STOREKEEPER", 1),
+                ("user_dahmane", p_hash_123, "مسير مخزون إقامة بن دحمان بشير", "STOREKEEPER", 2),
+                ("user_malek", p_hash_123, "مسير مخزون إقامة بن مالك محمد حسان", "STOREKEEPER", 3),
+                ("user_hassani", p_hash_123, "مسير مخزون إقامة حساني محمد", "STOREKEEPER", 4),
+                ("user_guerbechi", p_hash_123, "مسير مخزون إقامة قربشي محمد الناجي", "STOREKEEPER", 5),
+                ("user_lakhdari", p_hash_123, "مسير مخزون إقامة لخضاري محمد", "STOREKEEPER", 6),
+                ("user_oubaidi", p_hash_123, "مسير مخزون إقامة محمد الطاهر العبيدي", "STOREKEEPER", 7),
+                ("user_ouargla1", p_hash_123, "مستخدم الإقامة 1", "RESIDENCE_USER", 7),
+                ("user_ouargla2", "8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92", "مستخدم الإقامة 2", "RESIDENCE_USER", 2),
+            ]
+            for uname, phash, fname, role, resid in users_data:
+                conn.execute("""
+                    INSERT INTO users (username, password_hash, full_name, role, residence_id, is_active)
+                    VALUES (?, ?, ?, ?, ?, 1)
+                    ON CONFLICT(username) DO UPDATE SET
+                        password_hash=excluded.password_hash,
+                        is_active=1,
+                        role=excluded.role,
+                        residence_id=excluded.residence_id;
+                """, (uname, phash, fname, role, resid))
+
+            conn.commit()
+            logger.info("Auto-seed executed successfully: 7 residences, 10 users verified.")
+    except Exception as e:
+        logger.error(f"Auto-seed error: {e}")
+
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -46,6 +148,7 @@ class NetworkServer:
         self.db = db_manager or DatabaseManager()
         self.auth_svc = AuthService(self.db)
         self.res_svc = ResidenceService(self.db)
+        auto_seed_database(self.db)
         self.server_thread: Optional[threading.Thread] = None
         self.httpd: Optional[ThreadedHTTPServer] = None
         self.is_running = False
@@ -113,7 +216,15 @@ class NetworkServer:
                             k, v = pair.split("=", 1)
                             query_params[k] = v
 
-                if path == "/api/status":
+                if path in ("/api/status", "/api/system/seed"):
+                    auto_seed_database(db)
+                    res_count = len(res_svc.list_residences(only_active=True))
+                    with db.get_connection() as conn:
+                        u_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                        try:
+                            ev_count = conn.execute("SELECT COUNT(*) FROM sync_events").fetchone()[0]
+                        except Exception:
+                            ev_count = 0
                     self._send_json(200, {
                         "status": "online",
                         "ip": local_ip,
@@ -121,6 +232,9 @@ class NetworkServer:
                         "system": "منظومة تسيير مخزون الإطعام الجامعي - مديرية الخدمات الجامعية",
                         "architecture": "Client-Server Multi-Campus Architecture",
                         "version": "3.0",
+                        "residences_active": res_count,
+                        "users_count": u_count,
+                        "sync_events_count": ev_count,
                         "server_time": datetime.datetime.now().isoformat()
                     })
 
@@ -612,27 +726,13 @@ class NetworkClient:
 
     def __init__(self, server_host: Optional[str] = None, port: Optional[int] = None):
         if server_host:
-            raw = server_host.strip()
-            p = port or 8050
-            if raw.startswith("http://") or raw.startswith("https://"):
-                d_part = raw.split("://", 1)[1]
-                if ":" in d_part or "/" in d_part or p in (80, 443):
-                    self.base_url = raw.rstrip("/")
-                else:
-                    self.base_url = f"{raw.rstrip('/')}:{p}"
-            else:
-                if ":" in raw:
-                    self.base_url = f"http://{raw}"
-                elif p == 443:
-                    self.base_url = f"https://{raw}"
-                else:
-                    self.base_url = f"http://{raw}:{p}"
-            self.server_host = raw
-            self.port = p
+            self.server_host = server_host.strip()
+            self.port = port or 8050
+            self.base_url = normalize_server_url(self.server_host, self.port)
         else:
             self.server_host = AppConfig.get("server_host", "127.0.0.1")
             self.port = AppConfig.get("server_port", 8050)
-            self.base_url = AppConfig.get_server_url()
+            self.base_url = normalize_server_url(self.server_host, self.port)
 
     def check_connection(self) -> bool:
         try:
@@ -659,7 +759,7 @@ class NetworkClient:
 
     def login(self, username: str, password: str) -> Dict[str, Any]:
         url = f"{self.base_url}/api/auth/login"
-        r = requests.post(url, json={"username": username, "password": password}, timeout=8.0)
+        r = requests.post(url, json={"username": username, "password": password}, timeout=35.0)
         if r.status_code == 200:
             return r.json()
         elif r.status_code in (401, 403):
