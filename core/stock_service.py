@@ -1,5 +1,6 @@
 import sqlite3
 import datetime
+import math
 from typing import List, Dict, Any, Optional, Tuple
 from database.db_manager import DatabaseManager
 
@@ -27,6 +28,8 @@ class StockService:
 
     def _enqueue_sync(self, entity_type: str, action: str, entity_id: Any, payload: Dict[str, Any], residence_id: Optional[int] = None):
         """إضافة حركة إلى رتل المزامنة في الخلفية عند العمل كعميل إقامة"""
+        if getattr(self, "_skip_enqueue", False):
+            return
         try:
             from core.config import AppConfig
             if AppConfig.is_client_mode() or AppConfig.get("auto_sync", True):
@@ -40,6 +43,15 @@ class StockService:
                     entity_id=str(entity_id),
                     payload=payload
                 )
+
+                # إرسال فوري فائق السرعة في الخلفية بمجرد الحفظ دون أي تأخير
+                import threading
+                def _instant_push():
+                    try:
+                        sync_s.push_pending(residence_id=r_id)
+                    except Exception:
+                        pass
+                threading.Thread(target=_instant_push, daemon=True).start()
         except Exception:
             pass
 
@@ -50,10 +62,10 @@ class StockService:
         r_id = residence_id or self.residence_id
         from core.cache_service import CacheService
         all_articles = CacheService.get_articles(self.db, residence_id=r_id, only_active=only_active)
-        
+
         if not search and category_id is None:
             return all_articles
-            
+
         results = all_articles
         if category_id is not None:
             results = [a for a in results if a.get("category_id") == category_id]
@@ -136,6 +148,11 @@ class StockService:
                         initial_stock, price_ttc, initial_stock * price_ttc, initial_stock
                     ))
             conn.commit()
+            try:
+                from core.cache_service import CacheService
+                CacheService.invalidate_articles(r_id if "r_id" in locals() else getattr(self, "residence_id", 1))
+            except Exception:
+                pass
             return article_id
 
     # -------------------------------------------------------------
@@ -218,7 +235,7 @@ class StockService:
 
                 if r_id == 1:
                     conn.execute("""
-                        UPDATE articles 
+                        UPDATE articles
                         SET current_stock = ?, current_pmp = ?
                         WHERE id = ?
                     """, (new_stock, new_pmp, it["article_id"]))
@@ -244,10 +261,40 @@ class StockService:
                 ))
 
             conn.commit()
+            try:
+                from core.cache_service import CacheService
+                CacheService.invalidate_articles(r_id if "r_id" in locals() else getattr(self, "residence_id", 1))
+            except Exception:
+                pass
             from core.cache_service import CacheService
-            CacheService.invalidate_articles(r_id)
+            CacheService.invalidate_articles(r_id if "r_id" in locals() else getattr(self, "residence_id", 1))
             self._enqueue_sync("entry_voucher", "CREATE", voucher_id, {"voucher": voucher, "items": items})
             return voucher_id
+
+    def get_entry_voucher_details(self, voucher_id: int) -> Dict[str, Any]:
+        """جلب تفاصيل وصل الدخول وبنوده للاطلاع والرقابة والتتبع من طرف المديرية"""
+        with self.db.get_connection() as conn:
+            v_cur = conn.execute("""
+                SELECT ev.*, s.name as supplier_name, r.name as residence_name
+                FROM entry_vouchers ev
+                LEFT JOIN suppliers s ON ev.supplier_id = s.id
+                LEFT JOIN residences r ON ev.residence_id = r.id
+                WHERE ev.id = ?
+            """, (voucher_id,))
+            v_row = v_cur.fetchone()
+            if not v_row:
+                return {}
+            voucher_data = dict(v_row)
+
+            items_cur = conn.execute("""
+                SELECT evi.*, a.name as article_name, a.code as article_code, a.unit
+                FROM entry_voucher_items evi
+                JOIN articles a ON evi.article_id = a.id
+                WHERE evi.voucher_id = ?
+                ORDER BY evi.id ASC
+            """, (voucher_id,))
+            voucher_data["items"] = [dict(r) for r in items_cur.fetchall()]
+            return voucher_data
 
     def get_next_voucher_number(self, voucher_kind: str = "ENTRY", year: Optional[int] = None) -> str:
         """
@@ -288,7 +335,15 @@ class StockService:
         with self.db.get_connection() as conn:
             # 1. فحص كفاية المخزون أولاً لمنع الرصيد السالب بشكل قاطع
             check_stock_setting = self.db.get_setting("alert_on_negative_stock", "1") == "1"
-            
+
+            # تجميع الكميات الإجمالية لكل مادة لفحص كفاية المخزون تراكمياً
+            req_by_art = {}
+            for it in items:
+                aid = it.get("article_id")
+                if aid:
+                    tot_req = float(it.get("qty_breakfast", 0.0) or 0.0) + float(it.get("qty_lunch", 0.0) or 0.0) + float(it.get("qty_dinner", 0.0) or 0.0) + float(it.get("qty_other", 0.0) or 0.0)
+                    req_by_art[aid] = req_by_art.get(aid, 0.0) + tot_req
+
             validated_items = []
             for it in items:
                 art_id = it["article_id"]
@@ -314,8 +369,9 @@ class StockService:
                     continue
 
                 avail = float(art_row["current_stock"] or 0.0)
-                if check_stock_setting and tot_q > avail:
-                    raise InsufficientStockError(art_row["name"], tot_q, avail)
+                cumulative_q = req_by_art.get(art_id, tot_q)
+                if not getattr(self, "_skip_enqueue", False) and check_stock_setting and cumulative_q > (avail + 1e-6):
+                    raise InsufficientStockError(art_row["name"], cumulative_q, avail)
 
                 # تحديد السعر المعتمد (تعاقدي أو PMP)
                 cost_mode = self.db.get_setting("cost_calculation_mode", "FIXED")
@@ -402,22 +458,27 @@ class StockService:
                     VALUES (?, ?, ?)
                     ON CONFLICT(residence_id, date) DO UPDATE SET
                         daily_food_expense = daily_food_expense + excluded.daily_food_expense,
-                        student_daily_cost = CASE 
+                        student_daily_cost = CASE
                             WHEN average_daily_meals > 0 THEN (daily_food_expense + excluded.daily_food_expense) / (average_daily_meals * 2)
-                            ELSE 0 
+                            ELSE 0
                         END
                 """, (v_date, r_id, total_voucher_cost))
 
             conn.commit()
+            try:
+                from core.cache_service import CacheService
+                CacheService.invalidate_articles(r_id if "r_id" in locals() else getattr(self, "residence_id", 1))
+            except Exception:
+                pass
             from core.cache_service import CacheService
-            CacheService.invalidate_articles(r_id)
+            CacheService.invalidate_articles(r_id if "r_id" in locals() else getattr(self, "residence_id", 1))
             self._enqueue_sync("exit_voucher", "CREATE", voucher_id, {"voucher": voucher, "items": items})
             return voucher_id
 
     # -------------------------------------------------------------
     # تقارير وبطاقات المخزون (Inventory & Stock Cards)
     # -------------------------------------------------------------
-    def get_stock_card(self, article_id: int, year: Optional[int] = None, month: Optional[int] = None, start_date: Optional[str] = None, end_date: Optional[str] = None) -> Dict[str, Any]:
+    def get_stock_card(self, article_id: int, year: Optional[int] = None, month: Optional[int] = None, start_date: Optional[str] = None, end_date: Optional[str] = None, residence_id: Optional[int] = None) -> Dict[str, Any]:
         """
         توليد بطاقة المخزون الشهرية أو لفترة مخصصة لمادة معينة (مكافئ ورقة بطاقة مخزون)
         تعرض حركة الأيام مع تتبع الأرصدة التراكمية
@@ -442,21 +503,29 @@ class StockService:
         start_date_str = d_start.isoformat()
         end_date_str = d_end.isoformat()
 
+        r_id = residence_id or self.residence_id
         with self.db.get_connection() as conn:
             art = conn.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
             if not art:
                 return {}
 
+            # جلب المخزون الأولي للإقامة المحددة
+            init_row = conn.execute(
+                "SELECT initial_stock FROM residence_articles WHERE article_id = ? AND residence_id = ?",
+                (article_id, r_id)
+            ).fetchone()
+            init_base = (init_row["initial_stock"] if (init_row and init_row["initial_stock"] is not None) else 0.0)
+
             # حساب رصيد بداية الفترة
             prior_in = conn.execute("""
-                SELECT COALESCE(SUM(qty_in), 0) FROM stock_movements 
+                SELECT COALESCE(SUM(qty_in), 0) FROM stock_movements
                 WHERE article_id = ? AND date < ? AND residence_id = ?
-            """, (article_id, start_date_str, self.residence_id)).fetchone()[0]
+            """, (article_id, start_date_str, r_id)).fetchone()[0]
             prior_out = conn.execute("""
-                SELECT COALESCE(SUM(qty_out), 0) FROM stock_movements 
+                SELECT COALESCE(SUM(qty_out), 0) FROM stock_movements
                 WHERE article_id = ? AND date < ? AND residence_id = ?
-            """, (article_id, start_date_str, self.residence_id)).fetchone()[0]
-            opening_stock = prior_in - prior_out
+            """, (article_id, start_date_str, r_id)).fetchone()[0]
+            opening_stock = init_base + prior_in - prior_out
 
             # جلب تفاصيل حركات الفترة مقسمة بالأيام
             cur_sup = conn.execute("""
@@ -465,7 +534,7 @@ class StockService:
                 JOIN entry_vouchers ev ON evi.voucher_id = ev.id
                 WHERE evi.article_id = ? AND ev.voucher_type = 'SUPPLIER' AND ev.date BETWEEN ? AND ? AND ev.residence_id = ?
                 GROUP BY ev.date
-            """, (article_id, start_date_str, end_date_str, self.residence_id))
+            """, (article_id, start_date_str, end_date_str, r_id))
             sup_by_date = {r["date"]: r["qty"] for r in cur_sup.fetchall()}
 
             cur_li = conn.execute("""
@@ -474,7 +543,7 @@ class StockService:
                 JOIN entry_vouchers ev ON evi.voucher_id = ev.id
                 WHERE evi.article_id = ? AND ev.voucher_type = 'LOAN_IN' AND ev.date BETWEEN ? AND ? AND ev.residence_id = ?
                 GROUP BY ev.date
-            """, (article_id, start_date_str, end_date_str, self.residence_id))
+            """, (article_id, start_date_str, end_date_str, r_id))
             li_by_date = {r["date"]: r["qty"] for r in cur_li.fetchall()}
 
             cur_lo = conn.execute("""
@@ -483,11 +552,11 @@ class StockService:
                 JOIN exit_vouchers ev ON evi.voucher_id = ev.id
                 WHERE evi.article_id = ? AND ev.voucher_type = 'LOAN_OUT' AND ev.date BETWEEN ? AND ? AND ev.residence_id = ?
                 GROUP BY ev.date
-            """, (article_id, start_date_str, end_date_str, self.residence_id))
+            """, (article_id, start_date_str, end_date_str, r_id))
             lo_by_date = {r["date"]: r["qty"] for r in cur_lo.fetchall()}
 
             cur_k = conn.execute("""
-                SELECT ev.date, 
+                SELECT ev.date,
                        SUM(evi.qty_breakfast) as bf,
                        SUM(evi.qty_lunch) as lu,
                        SUM(evi.qty_dinner) as di
@@ -495,7 +564,7 @@ class StockService:
                 JOIN exit_vouchers ev ON evi.voucher_id = ev.id
                 WHERE evi.article_id = ? AND ev.voucher_type = 'KITCHEN' AND ev.date BETWEEN ? AND ? AND ev.residence_id = ?
                 GROUP BY ev.date
-            """, (article_id, start_date_str, end_date_str, self.residence_id))
+            """, (article_id, start_date_str, end_date_str, r_id))
             k_by_date = {r["date"]: {"bf": r["bf"], "lu": r["lu"], "di": r["di"]} for r in cur_k.fetchall()}
 
             # بناء جدول الأيام مع تتبع الأرصدة
@@ -566,7 +635,7 @@ class StockService:
                 "days": daily_rows
             }
 
-    def get_monthly_inventory(self, year: Optional[int] = None, month: Optional[int] = None, start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_monthly_inventory(self, year: Optional[int] = None, month: Optional[int] = None, start_date: Optional[str] = None, end_date: Optional[str] = None, residence_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         توليد بطاقة الجرد لجميع المواد (مكافئ ورقة جرد)
         يدعم العرض الشهري الافتراضي أو فترة مخصصة من تاريخ إلى تاريخ
@@ -586,9 +655,18 @@ class StockService:
         start_date_str = d_start.isoformat()
         end_date_str = d_end.isoformat()
 
-        r_id = self.residence_id
+        r_id = residence_id or self.residence_id
         with self.db.get_connection() as conn:
             articles = conn.execute("SELECT * FROM articles WHERE is_active = 1 ORDER BY id ASC").fetchall()
+
+            # 0. جلب المخزون الأولي للإقامة المحددة من جدول residence_articles
+            init_stocks = {
+                r["article_id"]: (r["initial_stock"] or 0.0)
+                for r in conn.execute(
+                    "SELECT article_id, initial_stock FROM residence_articles WHERE residence_id = ?",
+                    (r_id,)
+                ).fetchall()
+            }
 
             # 1. تجميع كل حركات ما قبل هذه الفترة لجميع المواد
             prior_moves = {
@@ -607,7 +685,7 @@ class StockService:
             period_moves = {
                 r["article_id"]: r
                 for r in conn.execute("""
-                    SELECT 
+                    SELECT
                         article_id,
                         COALESCE(SUM(CASE WHEN movement_type = 'SUPPLY_IN' THEN qty_in ELSE 0 END), 0) as sup_qty,
                         COALESCE(SUM(CASE WHEN movement_type = 'LOAN_IN' THEN qty_in ELSE 0 END), 0) as loan_in_qty,
@@ -624,7 +702,8 @@ class StockService:
                 art_id = art["id"]
                 p_ttc = art["price_ttc"]
 
-                init_qty = prior_moves.get(art_id, 0.0)
+                init_base = init_stocks.get(art_id, 0.0)
+                init_qty = init_base + prior_moves.get(art_id, 0.0)
                 m_row = period_moves.get(art_id)
                 sup_qty = m_row["sup_qty"] if m_row else 0.0
                 loan_in_qty = m_row["loan_in_qty"] if m_row else 0.0
@@ -655,28 +734,76 @@ class StockService:
 
             return inventory_rows
 
-    def get_low_stock_articles(self) -> List[Dict[str, Any]]:
-        """المواد التي اقترب مخزونها من الحد الأدنى أو نفدت للتنبيه الفوري"""
+    def get_low_stock_articles(self, residence_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """المواد التي اقترب مخزونها من الحد الأدنى أو نفدت للتنبيه الفوري للإقامة المحددة"""
+        r_id = residence_id or self.residence_id
         with self.db.get_connection() as conn:
             cur = conn.execute("""
-                SELECT a.*, c.name as category_name
+                SELECT a.id, a.code, a.name, a.category_id, a.unit,
+                       a.price_ht, a.discount_rate, a.discount_amount, a.price_after_discount,
+                       a.tva_rate, a.price_ttc,
+                       COALESCE(ra.current_pmp, a.current_pmp, a.price_ttc) as current_pmp,
+                       COALESCE(ra.safety_stock, a.safety_stock, 0.0) as safety_stock,
+                       COALESCE(ra.initial_stock, a.initial_stock, 0.0) as initial_stock,
+                       COALESCE(ra.current_stock, a.current_stock, 0.0) as current_stock,
+                       a.is_active, c.name as category_name
                 FROM articles a
                 LEFT JOIN categories c ON a.category_id = c.id
-                WHERE a.is_active = 1 AND a.current_stock <= a.safety_stock
-                ORDER BY a.current_stock ASC
-            """)
+                LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                WHERE a.is_active = 1 AND COALESCE(ra.current_stock, a.current_stock, 0.0) <= COALESCE(ra.safety_stock, a.safety_stock, 0.0)
+                ORDER BY COALESCE(ra.current_stock, a.current_stock, 0.0) ASC
+            """, (r_id,))
             return [dict(r) for r in cur.fetchall()]
 
-    def get_dashboard_kpis(self) -> Dict[str, Any]:
-        """إحصائيات لوحة التحكم السريعة"""
+    def get_dashboard_kpis(self, residence_id: Optional[int] = None) -> Dict[str, Any]:
+        """إحصائيات لوحة التحكم السريعة للإقامة المحددة"""
+        r_id = residence_id or self.residence_id
         with self.db.get_connection() as conn:
-            tot_articles = conn.execute("SELECT COUNT(*) FROM articles WHERE is_active = 1").fetchone()[0]
-            tot_val = conn.execute("SELECT SUM(current_stock * price_ttc) FROM articles WHERE is_active = 1").fetchone()[0] or 0.0
-            low_stock_count = conn.execute("SELECT COUNT(*) FROM articles WHERE is_active = 1 AND current_stock <= safety_stock").fetchone()[0]
-            
+            # 1. عدد المواد النشطة التابعة للإقامة (أو بالدليل العام)
+            res_arts_count = conn.execute("""
+                SELECT COUNT(DISTINCT a.id)
+                FROM articles a
+                JOIN residence_articles ra ON a.id = ra.article_id
+                WHERE ra.residence_id = ? AND a.is_active = 1
+            """, (r_id,)).fetchone()
+            tot_articles = res_arts_count[0] if (res_arts_count and res_arts_count[0] > 0) else conn.execute("SELECT COUNT(*) FROM articles WHERE is_active = 1").fetchone()[0]
+
+            # 2. القيمة الإجمالية للمخزون للإقامة المحددة
+            tot_val_row = conn.execute("""
+                SELECT SUM(COALESCE(ra.current_stock, a.current_stock, 0.0) * a.price_ttc)
+                FROM articles a
+                LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                WHERE a.is_active = 1
+            """, (r_id,)).fetchone()
+            tot_val = max(0.0, float(tot_val_row[0])) if (tot_val_row and tot_val_row[0] is not None) else 0.0
+
+            # 3. عدد المواد التي اقترب مخزونها من الحد الأدنى أو نفدت للإقامة المحددة
+            low_stock_row = conn.execute("""
+                SELECT COUNT(*)
+                FROM articles a
+                LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                WHERE a.is_active = 1 AND COALESCE(ra.current_stock, a.current_stock, 0.0) <= COALESCE(ra.safety_stock, a.safety_stock, 0.0)
+            """, (r_id,)).fetchone()
+            low_stock_count = low_stock_row[0] if (low_stock_row and low_stock_row[0] is not None) else 0
+
+            # 4. مصاريف إطعام اليوم الحالي للإقامة المحددة
             today_str = datetime.date.today().isoformat()
-            today_expense = conn.execute("SELECT COALESCE(daily_food_expense, 0) FROM daily_meals_tracking WHERE date = ?", (today_str,)).fetchone()
-            today_exp_val = today_expense[0] if today_expense else 0.0
+            today_expense = conn.execute("""
+                SELECT COALESCE(daily_food_expense, 0)
+                FROM daily_meals_tracking
+                WHERE date = ? AND residence_id = ?
+            """, (today_str, r_id)).fetchone()
+            today_exp_val = float(today_expense[0]) if (today_expense and today_expense[0] is not None) else 0.0
+
+            # في حال لم تسجل ورقة الوجبات بعد، جلب مجموع وصولات الخروج لليوم الحالي
+            if today_exp_val == 0.0:
+                v_exp = conn.execute("""
+                    SELECT COALESCE(SUM(total_amount), 0)
+                    FROM exit_vouchers
+                    WHERE date = ? AND residence_id = ? AND voucher_type = 'DAILY_CONSUMPTION'
+                """, (today_str, r_id)).fetchone()
+                if v_exp and v_exp[0]:
+                    today_exp_val = float(v_exp[0])
 
             return {
                 "total_articles": tot_articles,
@@ -779,6 +906,11 @@ class StockService:
                 initial_day_stock = init_base + prior_moves.get(art_id, 0.0)
 
                 sup_qty = supply_items.get(art_id, 0.0)
+                # حصر قيم توريد 01/09/2026 في عمود مخزون أول مدة فقط لجميع الإقامات
+                if date_str in ("2026-09-01", "01-09-2026") and sup_qty > 0:
+                    initial_day_stock += sup_qty
+                    sup_qty = 0.0
+
                 li_qty = loan_in_items.get(art_id, 0.0)
 
                 k_info = kitchen_items.get(art_id, {"bf": 0.0, "lu": 0.0, "di": 0.0, "other": 0.0})
@@ -822,7 +954,13 @@ class StockService:
             # 3. إحصائيات التذاكر وقائمة الطعام
             meal_cur = conn.execute("SELECT * FROM daily_meals_tracking WHERE date = ? AND residence_id = ?", (date_str, r_id))
             meal_row = meal_cur.fetchone()
-            meal_data = dict(meal_row) if meal_row else {
+            if meal_row:
+                meal_data = dict(meal_row)
+                raw_avg = meal_data.get("average_daily_meals", 0.0)
+                if raw_avg > 0:
+                    meal_data["average_daily_meals"] = float(raw_avg)
+            else:
+                meal_data = {
                 "date": date_str,
                 "residence_id": r_id,
                 "bf_students": 0, "bf_staff": 0, "bf_professors": 0, "bf_guests": 0, "bf_free": 0, "bf_total": 0,
@@ -831,8 +969,11 @@ class StockService:
                 "average_daily_meals": 0.0,
                 "daily_food_expense": grand_total_expense,
                 "student_daily_cost": 0.0,
-                "menu_breakfast": "", "menu_lunch": "", "menu_dinner": ""
+                "menu_breakfast": "", "menu_lunch": "", "menu_dinner": "",
+                "notes": ""
             }
+            if "notes" not in meal_data or meal_data["notes"] is None:
+                meal_data["notes"] = ""
 
             if grand_total_expense == 0 and meal_data.get("daily_food_expense", 0) > 0:
                 tot_bf_expense = float(meal_data.get("bf_expense") or 0.0)
@@ -851,13 +992,31 @@ class StockService:
                 "meals": meal_data
             }
 
-    def save_daily_sheet_full(self, date_str: str, articles_input: List[Dict[str, Any]], tickets_input: Optional[Dict[str, Any]] = None, menu_input: Optional[Dict[str, str]] = None, residence_id: Optional[int] = None) -> None:
+    def save_daily_sheet_full(self, date_str: str, articles_input: List[Dict[str, Any]], tickets_input: Optional[Dict[str, Any]] = None, menu_input: Optional[Dict[str, str]] = None, residence_id: Optional[int] = None, notes: Optional[str] = None) -> None:
         """حفظ ورقة اليوم بالكامل: الاستهلاك، التوريد، التذاكر، وتحديث الأرصدة دفعة واحدة"""
         r_id = residence_id or self.residence_id
+
+        # 0. التحقق الصارم من كفاية المخزون ومنع الرصيد السالب بشكل قاطع
+        for it in articles_input:
+            init = float(it.get("initial_stock", 0.0) or 0.0)
+            sup = float(it.get("supply_qty", 0.0) or 0.0)
+            li = float(it.get("loan_in_qty", 0.0) or 0.0)
+            avail = init + sup + li
+
+            bf = float(it.get("bf_qty", 0.0) or 0.0)
+            lu = float(it.get("lu_qty", 0.0) or 0.0)
+            di = float(it.get("di_qty", 0.0) or 0.0)
+            lo = float(it.get("loan_out_qty", 0.0) or 0.0)
+            tot_out = bf + lu + di + lo
+
+            if tot_out > 1e-6 and tot_out > (avail + 1e-6):
+                art_name = it.get("name", f"المادة #{it.get('id')}")
+                raise InsufficientStockError(art_name, tot_out, max(0.0, avail))
+
         with self.db.get_connection() as conn:
             # 1. معالجة خروج المطبخ (KITCHEN)
             kitchen_items = [it for it in articles_input if (it.get("bf_qty", 0) > 0 or it.get("lu_qty", 0) > 0 or it.get("di_qty", 0) > 0)]
-            
+
             # حذف وصولات الاستهلاك السابقة لهذا اليوم لإعادة بنائها بدقة
             old_ev = conn.execute("SELECT id FROM exit_vouchers WHERE date = ? AND voucher_type = 'KITCHEN' AND residence_id = ?", (date_str, r_id)).fetchall()
             for r in old_ev:
@@ -911,17 +1070,95 @@ class StockService:
                             VALUES (?, ?, 'DINNER_OUT', ?, ?, 0, ?, ?, ?, 0)
                         """, (date_str, it["id"], voucher_id, r_id, di, p, di * p))
 
-            # 2. ملاحظة هامة: الإعارة (LOAN_OUT) والاستعارة (LOAN_IN) تدار حصرياً ومباشرة
-            # عبر نظام "حركة الإعارة والاستعارة بين الإقامات" لضمان التحويل التبادلي الآلي للرصيد
-            # ولا يتم مسحها أو استبدالها من ورقة الاستهلاك اليومي.
+            # 2. معالجة الاستعارة (LOAN_IN) المسجلة يدوياً في ورقة اليوم
+            loan_in_items = [it for it in articles_input if it.get("loan_in_qty", 0) > 0]
+            old_li = conn.execute("""
+                SELECT id FROM entry_vouchers
+                WHERE date = ? AND voucher_type = 'LOAN_IN' AND residence_id = ?
+                  AND (delivery_note_ref = 'AUTO-DAILY'
+                       OR voucher_number LIKE 'BE-%-LOAN-IN%'
+                       OR notes LIKE '%استعارة ورقة اليوم%')
+            """, (date_str, r_id)).fetchall()
+
+            for r in old_li:
+                conn.execute("DELETE FROM entry_voucher_items WHERE voucher_id = ?", (r["id"],))
+                conn.execute("DELETE FROM entry_vouchers WHERE id = ?", (r["id"],))
+                conn.execute("DELETE FROM stock_movements WHERE voucher_id = ? AND movement_type = 'LOAN_IN' AND residence_id = ?", (r["id"], r_id))
+
+            if loan_in_items:
+                tot_li = sum(float(it.get("loan_in_qty", 0)) * float(it["price_ttc"]) for it in loan_in_items)
+                cur = conn.execute("""
+                    INSERT INTO entry_vouchers (voucher_number, date, voucher_type, residence_id, delivery_note_ref, total_amount, notes)
+                    VALUES (?, ?, 'LOAN_IN', ?, 'AUTO-DAILY', ?, 'استعارة ورقة اليوم')
+                """, (f"BE-{r_id}-{date_str}-LOAN-IN", date_str, r_id, tot_li))
+                li_id = cur.lastrowid
+                for it in loan_in_items:
+                    q = float(it["loan_in_qty"])
+                    p = float(it["price_ttc"])
+                    conn.execute("""
+                        INSERT INTO entry_voucher_items (voucher_id, article_id, quantity, unit_price_ttc, total_price)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (li_id, it["id"], q, p, q * p))
+                    conn.execute("""
+                        INSERT INTO stock_movements (date, article_id, movement_type, voucher_id, residence_id, qty_in, qty_out, unit_price, total_value, balance_after)
+                        VALUES (?, ?, 'LOAN_IN', ?, ?, ?, 0, ?, ?, 0)
+                    """, (date_str, it["id"], li_id, r_id, q, p, q * p))
+
+            # 2.2 معالجة الإعارة (LOAN_OUT) المسجلة يدوياً في ورقة اليوم
+            loan_out_items = [it for it in articles_input if it.get("loan_out_qty", 0) > 0]
+            old_lo = conn.execute("""
+                SELECT id FROM exit_vouchers
+                WHERE date = ? AND voucher_type = 'LOAN_OUT' AND residence_id = ?
+                  AND (voucher_number LIKE 'BS-%-LOAN-OUT%'
+                       OR notes LIKE '%إعارة ورقة اليوم%')
+            """, (date_str, r_id)).fetchall()
+
+            for r in old_lo:
+                conn.execute("DELETE FROM exit_voucher_items WHERE voucher_id = ?", (r["id"],))
+                conn.execute("DELETE FROM exit_vouchers WHERE id = ?", (r["id"],))
+                conn.execute("DELETE FROM stock_movements WHERE voucher_id = ? AND movement_type = 'LOAN_OUT' AND residence_id = ?", (r["id"], r_id))
+
+            if loan_out_items:
+                tot_lo = sum(float(it.get("loan_out_qty", 0)) * float(it["price_ttc"]) for it in loan_out_items)
+                cur = conn.execute("""
+                    INSERT INTO exit_vouchers (voucher_number, date, voucher_type, residence_id, total_amount, notes)
+                    VALUES (?, ?, 'LOAN_OUT', ?, ?, 'إعارة ورقة اليوم')
+                """, (f"BS-{r_id}-{date_str}-LOAN-OUT", date_str, r_id, tot_lo))
+                lo_id = cur.lastrowid
+                for it in loan_out_items:
+                    q = float(it["loan_out_qty"])
+                    p = float(it["price_ttc"])
+                    conn.execute("""
+                        INSERT INTO exit_voucher_items (voucher_id, article_id, qty_breakfast, qty_lunch, qty_dinner, qty_other, total_qty, unit_price_ttc, total_cost)
+                        VALUES (?, ?, 0, 0, 0, ?, ?, ?, ?)
+                    """, (lo_id, it["id"], q, q, p, q * p))
+                    conn.execute("""
+                        INSERT INTO stock_movements (date, article_id, movement_type, voucher_id, residence_id, qty_in, qty_out, unit_price, total_value, balance_after)
+                        VALUES (?, ?, 'LOAN_OUT', ?, ?, 0, ?, ?, ?, 0)
+                    """, (date_str, it["id"], lo_id, r_id, q, p, q * p))
 
             # 3. معالجة التوريد (SUPPLY)
             supply_items = [it for it in articles_input if it.get("supply_qty", 0) > 0]
+            if date_str in ("2026-09-01", "01-09-2026"):
+                # في يوم 01/09/2026 حصراً: أي توريد يُحفظ مباشرة كمخزون أول مدة لجميع الإقامات
+                for it in supply_items:
+                    q = float(it.get("supply_qty", 0.0))
+                    p = float(it.get("price_ttc", 0.0))
+                    if q > 0:
+                        conn.execute("""
+                            INSERT INTO residence_articles (residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp)
+                            VALUES (?, ?, ?, ?, 10.0, ?)
+                            ON CONFLICT(residence_id, article_id) DO UPDATE SET
+                                initial_stock = initial_stock + excluded.initial_stock
+                        """, (r_id, it["id"], q, q, p))
+                        if r_id == 1:
+                            conn.execute("UPDATE articles SET initial_stock = initial_stock + ? WHERE id = ?", (q, it["id"]))
+                supply_items = []
             old_sup = conn.execute("""
-                SELECT id FROM entry_vouchers 
+                SELECT id FROM entry_vouchers
                 WHERE date = ? AND voucher_type = 'SUPPLIER' AND residence_id = ?
-                  AND (delivery_note_ref = 'AUTO-DAILY' 
-                       OR voucher_number LIKE 'BE-%-SUP%' 
+                  AND (delivery_note_ref = 'AUTO-DAILY'
+                       OR voucher_number LIKE 'BE-%-SUP%'
                        OR voucher_number LIKE 'BE-SUPP-%'
                        OR notes LIKE '%ورقة اليوم%'
                        OR notes LIKE '%إكسل%')
@@ -989,8 +1226,17 @@ class StockService:
                 lu_tot = tickets_input.get("lu_students", 0) + tickets_input.get("lu_staff", 0) + tickets_input.get("lu_professors", 0) + tickets_input.get("lu_guests", 0) + tickets_input.get("lu_free", 0)
                 di_tot = tickets_input.get("di_students", 0) + tickets_input.get("di_staff", 0) + tickets_input.get("di_professors", 0) + tickets_input.get("di_guests", 0) + tickets_input.get("di_free", 0)
 
-                avg_m = (lu_tot + di_tot) / 2.0 if di_tot > 0 else float(lu_tot)
-                cost_stud = (exp_val / avg_m / 2.0) if avg_m > 0 else 0.0
+                if di_tot == 0:
+                    avg_m = float(lu_tot)
+                else:
+                    avg_m = float((lu_tot + di_tot) / 2.0)
+                tot_lu_di = lu_tot + di_tot
+                if di_tot > 0 and tot_lu_di > 0:
+                    cost_stud = exp_val / float(tot_lu_di)
+                elif lu_tot > 0:
+                    cost_stud = exp_val / float(lu_tot)
+                else:
+                    cost_stud = 0.0
                 menu_in = menu_input or {}
 
                 if existing_meal:
@@ -1000,7 +1246,8 @@ class StockService:
                             lu_students = ?, lu_staff = ?, lu_professors = ?, lu_guests = ?, lu_free = ?, lu_total = ?,
                             di_students = ?, di_staff = ?, di_professors = ?, di_guests = ?, di_free = ?, di_total = ?,
                             average_daily_meals = ?, daily_food_expense = ?, student_daily_cost = ?,
-                            menu_breakfast = ?, menu_lunch = ?, menu_dinner = ?
+                            menu_breakfast = ?, menu_lunch = ?, menu_dinner = ?,
+                            notes = CASE WHEN ? IS NOT NULL THEN ? ELSE notes END
                         WHERE id = ?
                     """, (
                         tickets_input.get("bf_students", 0), tickets_input.get("bf_staff", 0), tickets_input.get("bf_professors", 0), tickets_input.get("bf_guests", 0), tickets_input.get("bf_free", 0), bf_tot,
@@ -1008,6 +1255,7 @@ class StockService:
                         tickets_input.get("di_students", 0), tickets_input.get("di_staff", 0), tickets_input.get("di_professors", 0), tickets_input.get("di_guests", 0), tickets_input.get("di_free", 0), di_tot,
                         avg_m, exp_val, cost_stud,
                         menu_in.get("menu_breakfast", ""), menu_in.get("menu_lunch", ""), menu_in.get("menu_dinner", ""),
+                        notes, notes,
                         existing_meal["id"]
                     ))
                 else:
@@ -1018,35 +1266,51 @@ class StockService:
                             lu_students, lu_staff, lu_professors, lu_guests, lu_free, lu_total,
                             di_students, di_staff, di_professors, di_guests, di_free, di_total,
                             average_daily_meals, daily_food_expense, student_daily_cost,
-                            menu_breakfast, menu_lunch, menu_dinner
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            menu_breakfast, menu_lunch, menu_dinner, notes
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         date_str, r_id,
                         tickets_input.get("bf_students", 0), tickets_input.get("bf_staff", 0), tickets_input.get("bf_professors", 0), tickets_input.get("bf_guests", 0), tickets_input.get("bf_free", 0), bf_tot,
                         tickets_input.get("lu_students", 0), tickets_input.get("lu_staff", 0), tickets_input.get("lu_professors", 0), tickets_input.get("lu_guests", 0), tickets_input.get("lu_free", 0), lu_tot,
                         tickets_input.get("di_students", 0), tickets_input.get("di_staff", 0), tickets_input.get("di_professors", 0), tickets_input.get("di_guests", 0), tickets_input.get("di_free", 0), di_tot,
                         avg_m, exp_val, cost_stud,
-                        menu_in.get("menu_breakfast", ""), menu_in.get("menu_lunch", ""), menu_in.get("menu_dinner", "")
+                        menu_in.get("menu_breakfast", ""), menu_in.get("menu_lunch", ""), menu_in.get("menu_dinner", ""),
+                        notes or ""
                     ))
             else:
                 # إذا كانت tickets_input فارغة أو None نحدث المصاريف فقط ونحافظ على التذاكر وقائمة الطعام السابقة
                 if existing_meal:
                     avg_m = existing_meal["average_daily_meals"] or 0.0
-                    cost_stud = (exp_val / avg_m / 2.0) if avg_m > 0 else 0.0
-                    conn.execute("UPDATE daily_meals_tracking SET daily_food_expense = ?, student_daily_cost = ? WHERE id = ?", (exp_val, cost_stud, existing_meal["id"]))
+                    di_c = existing_meal["di_total"] if "di_total" in existing_meal.keys() else 1
+                    if di_c > 0 and avg_m > 0:
+                        cost_stud = (exp_val / avg_m / 2.0)
+                    elif avg_m > 0:
+                        cost_stud = exp_val / avg_m
+                    else:
+                        cost_stud = 0.0
+                    if notes is not None:
+                        conn.execute("UPDATE daily_meals_tracking SET daily_food_expense = ?, student_daily_cost = ?, notes = ? WHERE id = ?", (exp_val, cost_stud, notes, existing_meal["id"]))
+                    else:
+                        conn.execute("UPDATE daily_meals_tracking SET daily_food_expense = ?, student_daily_cost = ? WHERE id = ?", (exp_val, cost_stud, existing_meal["id"]))
                 else:
                     conn.execute("""
-                        INSERT INTO daily_meals_tracking (date, residence_id, daily_food_expense, student_daily_cost)
-                        VALUES (?, ?, ?, 0.0)
-                    """, (date_str, r_id, exp_val))
+                        INSERT INTO daily_meals_tracking (date, residence_id, daily_food_expense, student_daily_cost, notes)
+                        VALUES (?, ?, ?, 0.0, ?)
+                    """, (date_str, r_id, exp_val, notes or ""))
 
             conn.commit()
+            try:
+                from core.cache_service import CacheService
+                CacheService.invalidate_articles(r_id if "r_id" in locals() else getattr(self, "residence_id", 1))
+            except Exception:
+                pass
 
         self._enqueue_sync("daily_sheet_full", "UPSERT", f"{r_id}_{date_str}", {
             "date": date_str,
             "articles": articles_input,
             "tickets": tickets_input,
-            "menus": menu_input
+            "menus": menu_input,
+            "notes": notes
         }, residence_id=r_id)
 
     def save_daily_general_info(self, date_str: str, tickets_input: Dict[str, Any], menu_input: Dict[str, str], expenses_input: Optional[Dict[str, float]] = None, residence_id: Optional[int] = None) -> None:
@@ -1057,7 +1321,11 @@ class StockService:
             lu_tot = sum(int(tickets_input.get(f"lu_{k}", 0)) for k in ["students", "staff", "professors", "guests", "free"])
             di_tot = sum(int(tickets_input.get(f"di_{k}", 0)) for k in ["students", "staff", "professors", "guests", "free"])
 
-            avg_m = (lu_tot + di_tot) / 2.0 if (lu_tot + di_tot) > 0 else 0.0
+            # معدل الوجبات بدقة تامة (مثال: 78.5 و 120.5)
+            if di_tot == 0:
+                avg_m = float(lu_tot)
+            else:
+                avg_m = float((lu_tot + di_tot) / 2.0)
 
             if expenses_input:
                 bf_exp = float(expenses_input.get("bf_expense", 0.0))
@@ -1071,7 +1339,7 @@ class StockService:
                            COALESCE(SUM(total_breakfast_cost), 0),
                            COALESCE(SUM(total_lunch_cost), 0),
                            COALESCE(SUM(total_dinner_cost), 0)
-                    FROM exit_vouchers 
+                    FROM exit_vouchers
                     WHERE date = ? AND voucher_type = 'KITCHEN' AND residence_id = ?
                 """, (date_str, r_id)).fetchone()
                 exp_val = float(exp_row[0]) if exp_row else 0.0
@@ -1079,7 +1347,13 @@ class StockService:
                 lu_exp = float(exp_row[2]) if exp_row else 0.0
                 di_exp = float(exp_row[3]) if exp_row else 0.0
 
-            cost_stud = (exp_val / avg_m / 2.0) if avg_m > 0 else 0.0
+            tot_lu_di = lu_tot + di_tot
+            if di_tot > 0 and tot_lu_di > 0:
+                cost_stud = exp_val / float(tot_lu_di)
+            elif lu_tot > 0:
+                cost_stud = exp_val / float(lu_tot)
+            else:
+                cost_stud = 0.0
 
             existing = conn.execute("SELECT id FROM daily_meals_tracking WHERE date = ? AND residence_id = ?", (date_str, r_id)).fetchone()
             if existing:
@@ -1122,6 +1396,18 @@ class StockService:
                     bf_exp, lu_exp, di_exp
                 ))
             conn.commit()
+            try:
+                from core.cache_service import CacheService
+                CacheService.invalidate_articles(r_id if "r_id" in locals() else getattr(self, "residence_id", 1))
+            except Exception:
+                pass
+
+        self._enqueue_sync("daily_general_info", "UPSERT", f"{r_id}_{date_str}", {
+            "date": date_str,
+            "tickets": tickets_input,
+            "menus": menu_input,
+            "expenses": expenses_input
+        }, residence_id=r_id)
 
     # -------------------------------------------------------------
     # 8. شبكات التتبع الشهرية (أوراق: نوريد، إستعارة، إستهلاك، عارة)
@@ -1222,12 +1508,13 @@ class StockService:
     # -------------------------------------------------------------
     # 9. الجدول التفصيلي الشهري (ورقة جدول تفصيلي في Excel)
     # -------------------------------------------------------------
-    def get_detailed_table(self, year: Optional[int] = None, month: Optional[int] = None, start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_detailed_table(self, year: Optional[int] = None, month: Optional[int] = None, start_date: Optional[str] = None, end_date: Optional[str] = None, residence_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         الجدول التفصيلي الرقابي الشهري أو لفترة مخصصة:
         المواد | الوحدة | مخزون أول الشهر | المدخولات (توريد + إستعارة) | المخروجات (إستهلاك + إعارة) | باقي المخزون
         """
-        jard = self.get_monthly_inventory(year, month, start_date=start_date, end_date=end_date)
+        r_id = residence_id or self.residence_id
+        jard = self.get_monthly_inventory(year, month, start_date=start_date, end_date=end_date, residence_id=r_id)
         detailed_rows = []
         for it in jard:
             detailed_rows.append({
@@ -1283,43 +1570,43 @@ class StockService:
             end_date_str = f"{rep_year:04d}-{last_m:02d}-{last_d:02d}"
 
         with self.db.get_connection() as conn:
-            # 1. قائمة الحصص المتوفرة لملء قائمة التصفية
+            # 1. قائمة الحصص المتوفرة لملء قائمة التصفية المخصصة لهذه الإقامة حصراً
             if trimester:
                 dist_lots = [
                     r[0] for r in conn.execute("""
-                        SELECT DISTINCT lot_name FROM supplier_allocations 
-                        WHERE year = ? AND trimester = ? AND lot_name IS NOT NULL
+                        SELECT DISTINCT lot_name FROM supplier_allocations
+                        WHERE year = ? AND trimester = ? AND residence_id = ? AND lot_name IS NOT NULL
                         ORDER BY lot_name ASC
-                    """, (rep_year, trimester)).fetchall()
+                    """, (rep_year, trimester, r_id)).fetchall()
                 ]
             else:
                 dist_lots = [
                     r[0] for r in conn.execute("""
-                        SELECT DISTINCT lot_name FROM supplier_allocations 
-                        WHERE year = ? AND lot_name IS NOT NULL
+                        SELECT DISTINCT lot_name FROM supplier_allocations
+                        WHERE year = ? AND residence_id = ? AND lot_name IS NOT NULL
                         ORDER BY lot_name ASC
-                    """, (rep_year,)).fetchall()
+                    """, (rep_year, r_id)).fetchall()
                 ]
 
-            # 2. بناء استعلام جلب الحصص
+            # 2. بناء استعلام جلب الحصص المخصصة للإقامة المحددة
             if trimester:
                 query = """
                     SELECT sa.*, a.name as article_name, a.unit, a.code, a.price_ttc, s.name as supplier_name
                     FROM supplier_allocations sa
                     JOIN articles a ON sa.article_id = a.id
                     LEFT JOIN suppliers s ON sa.supplier_id = s.id
-                    WHERE sa.year = ? AND sa.trimester = ?
+                    WHERE sa.year = ? AND sa.trimester = ? AND sa.residence_id = ?
                 """
-                params = [rep_year, trimester]
+                params = [rep_year, trimester, r_id]
             else:
                 query = """
                     SELECT sa.*, a.name as article_name, a.unit, a.code, a.price_ttc, s.name as supplier_name
                     FROM supplier_allocations sa
                     JOIN articles a ON sa.article_id = a.id
                     LEFT JOIN suppliers s ON sa.supplier_id = s.id
-                    WHERE sa.year = ?
+                    WHERE sa.year = ? AND sa.residence_id = ?
                 """
-                params = [rep_year]
+                params = [rep_year, r_id]
 
             if lot_name and lot_name != "ALL":
                 query += " AND sa.lot_name = ?"
@@ -1331,14 +1618,14 @@ class StockService:
             query += " ORDER BY sa.lot_name ASC, a.id ASC"
             alloc_rows = conn.execute(query, params).fetchall()
 
-            # 3. جلب المدخولات الفعلية من وصولات الاستلام
+            # 3. جلب المدخولات الفعلية من وصولات الاستلام المخصصة لهذه الإقامة حصراً
             sup_cur = conn.execute("""
                 SELECT evi.article_id, SUM(evi.quantity) as actual_qty, SUM(evi.total_price) as actual_amount
                 FROM entry_voucher_items evi
                 JOIN entry_vouchers ev ON evi.voucher_id = ev.id
-                WHERE ev.date >= ? AND ev.date <= ? AND ev.voucher_type = 'SUPPLIER'
+                WHERE ev.date >= ? AND ev.date <= ? AND ev.voucher_type = 'SUPPLIER' AND ev.residence_id = ?
                 GROUP BY evi.article_id
-            """, (start_date_str, end_date_str))
+            """, (start_date_str, end_date_str, r_id))
             sup_map = {r["article_id"]: {"qty": r["actual_qty"], "amt": r["actual_amount"]} for r in sup_cur.fetchall()}
 
             items_list = []
@@ -1423,6 +1710,70 @@ class StockService:
                 l_grp["tot_actual_amt"] += act_a
                 l_grp["tot_diff_amt_excess"] += diff_a_excess
                 l_grp["tot_diff_amt_deficit"] += diff_a_deficit
+
+            # إذا كانت هناك وصولات توريد فعلية مسجلة لهذه الإقامة لمواد غير مدرجة في جدول الحصص
+            allocated_art_ids = {sa["article_id"] for sa in alloc_rows}
+            unallocated_art_ids = [aid for aid in sup_map.keys() if aid not in allocated_art_ids]
+            if unallocated_art_ids:
+                q_extra = f"SELECT a.id, a.code, a.name as article_name, a.unit, a.price_ttc, c.name as category_name FROM articles a LEFT JOIN categories c ON a.category_id = c.id WHERE a.id IN ({','.join(['?']*len(unallocated_art_ids))})"
+                extra_arts = {a["id"]: a for a in conn.execute(q_extra, unallocated_art_ids).fetchall()}
+                for aid in unallocated_art_ids:
+                    a_info = extra_arts.get(aid)
+                    if not a_info:
+                        continue
+                    actual = sup_map[aid]
+                    act_q = actual["qty"]
+                    act_a = actual["amt"]
+                    if act_q <= 0 and act_a <= 0:
+                        continue
+                    p = a_info["price_ttc"] or (act_a / act_q if act_q > 0 else 0.0)
+
+                    c_lot = a_info["category_name"] if ("category_name" in a_info.keys() and a_info["category_name"]) else "حصة المواد الغذائية الموردة"
+                    if lot_name and lot_name != "ALL" and c_lot != lot_name:
+                        continue
+
+                    tot_actual_qty += act_q
+                    tot_actual_amt += act_a
+                    tot_diff_amt_excess += act_a
+                    c_supp = "المورد المعتمد"
+
+                    item_obj = {
+                        "index": len(items_list) + 1,
+                        "article_id": aid,
+                        "code": a_info["code"] or f"{len(items_list)+1:02d}",
+                        "name": a_info["article_name"],
+                        "lot_name": c_lot,
+                        "supplier_name": c_supp,
+                        "unit": a_info["unit"],
+                        "price_ttc": p,
+                        "allocated_qty": 0.0,
+                        "allocated_amt": 0.0,
+                        "actual_qty": act_q,
+                        "actual_amt": act_a,
+                        "diff_qty_excess": act_q,
+                        "diff_qty_deficit": 0.0,
+                        "diff_amt_excess": act_a,
+                        "diff_amt_deficit": 0.0
+                    }
+                    items_list.append(item_obj)
+
+                    if c_lot not in lots_dict:
+                        lots_dict[c_lot] = {
+                            "lot_name": c_lot,
+                            "supplier_name": c_supp,
+                            "items": [],
+                            "tot_allocated_qty": 0.0,
+                            "tot_allocated_amt": 0.0,
+                            "tot_actual_qty": 0.0,
+                            "tot_actual_amt": 0.0,
+                            "tot_diff_amt_excess": 0.0,
+                            "tot_diff_amt_deficit": 0.0
+                        }
+                    l_grp = lots_dict[c_lot]
+                    l_grp["items"].append(item_obj)
+                    l_grp["tot_actual_qty"] += act_q
+                    l_grp["tot_actual_amt"] += act_a
+                    l_grp["tot_diff_amt_excess"] += act_a
 
             return {
                 "year": rep_year,
@@ -1707,6 +2058,11 @@ class StockService:
                 """, (loan_id, art_id, qty, p_ttc, tot_p))
 
             conn.commit()
+            try:
+                from core.cache_service import CacheService
+                CacheService.invalidate_articles(r_id if "r_id" in locals() else getattr(self, "residence_id", 1))
+            except Exception:
+                pass
             return loan_id
 
     def get_outgoing_loans(
@@ -1969,6 +2325,11 @@ class StockService:
             """, (exit_v_id, entry_v_id, loan_id))
 
             conn.commit()
+            try:
+                from core.cache_service import CacheService
+                CacheService.invalidate_articles(r_id if "r_id" in locals() else getattr(self, "residence_id", 1))
+            except Exception:
+                pass
 
         # إبطال الذاكرة المؤقتة للإقامتَين
         from core.cache_service import CacheService
@@ -1987,6 +2348,11 @@ class StockService:
 
             conn.execute("UPDATE residence_loans SET status = 'CANCELLED' WHERE id = ?", (loan_id,))
             conn.commit()
+            try:
+                from core.cache_service import CacheService
+                CacheService.invalidate_articles(r_id if "r_id" in locals() else getattr(self, "residence_id", 1))
+            except Exception:
+                pass
             return True
 
     def revert_confirmed_loan(
@@ -2115,6 +2481,11 @@ class StockService:
             """, (final_status, updated_notes, loan_id))
 
             conn.commit()
+            try:
+                from core.cache_service import CacheService
+                CacheService.invalidate_articles(r_id if "r_id" in locals() else getattr(self, "residence_id", 1))
+            except Exception:
+                pass
 
         # إبطال كاش الأرصدة للإقامتَين
         from core.cache_service import CacheService
@@ -2162,5 +2533,3 @@ class StockService:
                 notes.append(f"تم إعارة {row['quantity']:g} {row['unit']} من مادة {row['article_name']} لفائدة {row['to_res_name']}.")
 
         return notes
-
-
