@@ -11,6 +11,25 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import string
 import requests
+import urllib3
+try:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+
+def http_get(url: str, timeout: float = 25.0, **kwargs):
+    """طلب GET ذكي متوافق 100% مع كافة إصدارات ويندوز ومعالجة شهادات SSL القديمة في Win 7/8"""
+    try:
+        return requests.get(url, timeout=timeout, **kwargs)
+    except requests.exceptions.SSLError:
+        return requests.get(url, timeout=timeout, verify=False, **kwargs)
+
+def http_post(url: str, timeout: float = 35.0, **kwargs):
+    """طلب POST ذكي متوافق 100% مع كافة إصدارات ويندوز ومعالجة شهادات SSL القديمة في Win 7/8"""
+    try:
+        return requests.post(url, timeout=timeout, **kwargs)
+    except requests.exceptions.SSLError:
+        return requests.post(url, timeout=timeout, verify=False, **kwargs)
 
 from database.db_manager import DatabaseManager
 from core.auth_service import AuthService
@@ -85,7 +104,7 @@ def auto_seed_database(db: DatabaseManager):
                 );
             """)
 
-            # 2. الإقامات السبع الرسمية
+            # 2. الإقامات والمطاعم المركزية الرسمية
             residences_data = [
                 (1, "RES-01", "الإقامة الجامعية بن الشيخ التلي", "ورقلة", "مدير الإقامة", 1000),
                 (2, "RES-02", "الإقامة الجامعية بن دحمان بشير", "ورقلة", "مدير الإقامة", 2000),
@@ -94,6 +113,8 @@ def auto_seed_database(db: DatabaseManager):
                 (5, "RES-05", "الإقامة الجامعية قربشي محمد الناجي", "ورقلة", "مدير الإقامة", 1000),
                 (6, "RES-06", "الإقامة الجامعية لخضاري محمد الأخضر", "ورقلة", "مدير الإقامة", 1000),
                 (7, "RES-07", "الإقامة الجامعية محمد الطاهر العبيدي", "ورقلة", "مدير الإقامة", 1500),
+                (8, "RES-08", "المطعم المركزي القطب الجامعي رقم 1", "ورقلة", "مدير المطعم", 1500),
+                (9, "RES-09", "المطعم المركزي القطب الجامعي رقم 3", "ورقلة", "مدير المطعم", 1500),
             ]
             for rid, code, name, city, dname, cap in residences_data:
                 conn.execute("""
@@ -102,7 +123,7 @@ def auto_seed_database(db: DatabaseManager):
                     ON CONFLICT(id) DO UPDATE SET is_active=1, name=excluded.name, code=excluded.code;
                 """, (rid, code, name, city, dname, cap))
 
-            # 3. المستخدمون الرسميون لكافة الإقامات والمديرية
+            # 3. المستخدمون الرسميون لكافة الإقامات والمطاعم والمديرية
             p_hash_123 = "pbkdf2$df2c0fad0cc882a1c7e1917bda568900bde268e625ffc0b621aa4f5551b4778e"
             p_hash_admin = "pbkdf2$6474a3ce2ee9459d80d7639a9cb11ae410fc579178bf98f1bd0753aa8f47553b" # admin123
             users_data = [
@@ -114,6 +135,8 @@ def auto_seed_database(db: DatabaseManager):
                 ("user_guerbechi", p_hash_123, "مسير مخزون إقامة قربشي محمد الناجي", "STOREKEEPER", 5),
                 ("user_lakhdari", p_hash_123, "مسير مخزون إقامة لخضاري محمد", "STOREKEEPER", 6),
                 ("user_oubaidi", p_hash_123, "مسير مخزون إقامة محمد الطاهر العبيدي", "STOREKEEPER", 7),
+                ("user_resto1", p_hash_123, "مسير مخزون المطعم المركزي القطب 1", "STOREKEEPER", 8),
+                ("user_resto3", p_hash_123, "مسير مخزون المطعم المركزي القطب 3", "STOREKEEPER", 9),
                 ("user_ouargla1", p_hash_123, "مستخدم الإقامة 1", "RESIDENCE_USER", 7),
                 ("user_ouargla2", "8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92", "مستخدم الإقامة 2", "RESIDENCE_USER", 2),
             ]
@@ -166,7 +189,7 @@ class NetworkServer:
         port = self.port
 
         _IP_REQUEST_LOG: Dict[str, List[float]] = {}
-        MAX_REQ_PER_MIN = 180
+        MAX_REQ_PER_MIN = 600
         MAX_PAYLOAD_SIZE = 5 * 1024 * 1024  # 5 MB max request size
 
         class RequestHandler(BaseHTTPRequestHandler):
@@ -174,7 +197,17 @@ class NetworkServer:
             sys_version = ""
 
             def _check_rate_limit(self) -> bool:
-                client_ip = self.client_address[0] if self.client_address else "unknown"
+                # دعم العناوين الحقيقية خلف البروكسي والسحابة (Render, Cloudflare, Reverse Proxies)
+                fwd = self.headers.get("X-Forwarded-For")
+                if fwd:
+                    client_ip = fwd.split(",")[0].strip()
+                else:
+                    client_ip = self.headers.get("CF-Connecting-IP") or (self.client_address[0] if self.client_address else "unknown")
+
+                # استثناء عناوين الشبكة المحلية والبروكسي الداخلي من التقييد الحاد
+                if client_ip.startswith("10.") or client_ip.startswith("127.") or client_ip.startswith("172.") or client_ip.startswith("192.168."):
+                    return True
+
                 now = time.time()
                 ts = [t for t in _IP_REQUEST_LOG.get(client_ip, []) if now - t < 60]
                 if len(ts) >= MAX_REQ_PER_MIN:
@@ -204,9 +237,11 @@ class NetworkServer:
                 self._send_json(200, {"status": "ok"})
 
             def do_GET(self):
-                if not self._check_rate_limit():
-                    self._send_json(429, {"error": "Rate limit exceeded. Please slow down."})
-                    return
+                path = self.path.split("?")[0]
+                if path not in ("/api/status", "/api/updates/check", "/api/updates/download", "/api/sync/pull"):
+                    if not self._check_rate_limit():
+                        self._send_json(429, {"error": "Rate limit exceeded. Please slow down."})
+                        return
                 path = self.path.split("?")[0]
                 query_params = {}
                 if "?" in self.path:
@@ -297,14 +332,17 @@ class NetworkServer:
 
                     ver_file = os.path.join(base_dir, "version.json")
                     ver_info = {
-                        "version": "2.8.0",
-                        "release_date": "2026-10-18",
-                        "title": "نظام تسيير مخزون الإطعام الجامعي - تحديث المطبوعات والشبكة",
+                        "version": "3.3.7",
+                        "release_date": "2026-10-27",
+                        "title": "نظام تسيير مخزون الإطعام الجامعي v3.3.7 - لوحة قيادة تفاعلية حسب الإقامة وتثبيت التذاكر",
                         "changelog": [
-                            "رسم خطوط واضحة ودقيقة (Borders) لكافة جداول التقارير والمطبوعات",
-                            "ضبط وتنسيق انتهاء كل صفحة بجدول الإمضاءات وبدء كل حصة في صفحة جديدة",
-                            "إضافة خاصية الطباعة بفترة مخصصة (من - إلى) لجميع التقارير الـ 8",
-                            "تحديث وتثبيت التحديثات تلقائياً عبر الفلاشة وعبر شبكة الوايفاي"
+                            "ربط جميع مؤشرات لوحة القيادة (Dashboard) بدقة بحسب الإقامة المختارة ديناميكياً",
+                            "تحديث جدول تنبيهات نواقص المخزون ومخزون الأمان تلقائياً وفورياً لكل إقامة",
+                            "تثبيت قيم تعداد التذاكر ومنع تغيرها عند تحريك عجلة الفأرة مع تمرير الشاشة فقط",
+                            "حماية حقول إدخال مصاريف الفطور والغداء والعشاء من عجلة الفأرة",
+                            "إخفاء شريط اختيار وتغيير الإقامة في شاشة التقارير عن حسابات الإقامات",
+                            "ظهور شريط اختيار الإقامة لمديرية الخدمات الجامعية فقط (SUPER_ADMIN)",
+                            "شمولية كافة ملفات الواجهات البرمجية والتقارير داخل حزمة التحديث"
                         ]
                     }
                     if os.path.exists(ver_file):
@@ -340,9 +378,11 @@ class NetworkServer:
                             break
 
                     req_host = self.headers.get("Host", f"{local_ip}:{port}")
-                    dl_url = f"http://{req_host}/api/updates/download" if patch_found else ""
+                    proto = "https" if ("render" in req_host or self.headers.get("X-Forwarded-Proto") == "https") else "http"
+                    raw_gh_patch = "https://raw.githubusercontent.com/islamnono3016-tech/onou-server/main/update_latest.dou_patch"
+                    dl_url = f"{proto}://{req_host}/api/updates/download" if patch_found else raw_gh_patch
                     self._send_json(200, {
-                        "version": ver_info.get("version", "2.8.0"),
+                        "version": ver_info.get("version", "3.3.7"),
                         "title": ver_info.get("title", "تحديث البرنامج"),
                         "release_date": ver_info.get("release_date", "2026-10-18"),
                         "changelog": ver_info.get("changelog", []),
@@ -378,8 +418,14 @@ class NetworkServer:
                                 pass
 
                     if p_files:
-                        # اختيار أحدث ملف تعديلاً
                         target_file = max(p_files, key=os.path.getmtime)
+
+                    if not target_file or not os.path.exists(target_file):
+                        # توجيه تلقائي للتنزيل المباشر من GitHub
+                        self.send_response(302)
+                        self.send_header("Location", "https://raw.githubusercontent.com/islamnono3016-tech/onou-server/main/update_latest.dou_patch")
+                        self.end_headers()
+                        return
 
                     if target_file and os.path.exists(target_file):
                         try:
@@ -491,11 +537,12 @@ class NetworkServer:
 
             def do_POST(self):
                 try:
-                    if not self._check_rate_limit():
-                        self._send_json(429, {"error": "Rate limit exceeded. Please slow down."})
-                        return
-
                     path = self.path.split("?")[0]
+                    # استثناء مزامنة بيانات الإقامات وتسجيل الدخول من التقييد
+                    if path not in ("/api/sync/push", "/api/auth/login"):
+                        if not self._check_rate_limit():
+                            self._send_json(429, {"error": "Rate limit exceeded. Please slow down."})
+                            return
                     content_len_hdr = self.headers.get("Content-Length", "0")
                     content_len = int(content_len_hdr) if content_len_hdr else 0
 
@@ -538,29 +585,53 @@ class NetworkServer:
                             if not sync_id:
                                 continue
 
+                            item_res_id = it.get("residence_id") or r_id or 1
+
                             # محاولة تطبيق الحركة في قاعدة البيانات المركزية
                             try:
+                                from core.stock_service import StockService
+                                stk = StockService(db, residence_id=item_res_id)
+                                stk._skip_enqueue = True  # منع إعادة الإرسال العكسي
+
                                 if entity_type == "daily_sheet_full":
-                                    from core.stock_service import StockService
-                                    stk = StockService(db, residence_id=r_id)
                                     stk.save_daily_sheet_full(
                                         data.get("date", ""),
                                         data.get("articles", []),
                                         tickets_input=data.get("tickets"),
-                                        menu_input=data.get("menus")
+                                        menu_input=data.get("menus"),
+                                        residence_id=item_res_id,
+                                        notes=data.get("notes")
+                                    )
+                                elif entity_type in ("daily_general_info", "daily_meals"):
+                                    stk.save_daily_general_info(
+                                        data.get("date", ""),
+                                        tickets_input=data.get("tickets", {}),
+                                        menu_input=data.get("menus", {}),
+                                        expenses_input=data.get("expenses", {}),
+                                        residence_id=item_res_id
                                     )
                                 elif entity_type == "entry_voucher":
-                                    from core.stock_service import StockService
-                                    stk = StockService(db, residence_id=r_id)
-                                    stk.create_entry_voucher(data.get("voucher", {}), data.get("items", []))
+                                    v_obj = data.get("voucher", {})
+                                    v_num = v_obj.get("voucher_number")
+                                    existing = None
+                                    if v_num:
+                                        with db.get_connection() as conn:
+                                            existing = conn.execute("SELECT id FROM entry_vouchers WHERE voucher_number = ? AND residence_id = ?", (v_num, item_res_id)).fetchone()
+                                    if not existing:
+                                        stk.create_entry_voucher(v_obj, data.get("items", []))
                                 elif entity_type == "exit_voucher":
-                                    from core.stock_service import StockService
-                                    stk = StockService(db, residence_id=r_id)
-                                    stk.create_exit_voucher(data.get("voucher", {}), data.get("items", []))
+                                    v_obj = data.get("voucher", {})
+                                    v_num = v_obj.get("voucher_number")
+                                    existing = None
+                                    if v_num:
+                                        with db.get_connection() as conn:
+                                            existing = conn.execute("SELECT id FROM exit_vouchers WHERE voucher_number = ? AND residence_id = ?", (v_num, item_res_id)).fetchone()
+                                    if not existing:
+                                        stk.create_exit_voucher(v_obj, data.get("items", []))
                             except Exception as item_err:
                                 logger.warning(f"Notice item sync {sync_id} ({entity_type}): {item_err}")
 
-                            
+
                             # تسجيل الحركة في سجل أحداث المزامنة لسحبها من الحواسيب الأخرى
                             try:
                                 payload_str = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
@@ -581,7 +652,7 @@ class NetworkServer:
                                         INSERT OR IGNORE INTO sync_events (sync_id, residence_id, entity_type, action, entity_id, payload, created_at)
                                         VALUES (?, ?, ?, ?, ?, ?, ?)
                                     """, (
-                                        sync_id, r_id, entity_type, it.get("action", "SAVE"),
+                                        sync_id, item_res_id, entity_type, it.get("action", "SAVE"),
                                         str(it.get("entity_id", "")), payload_str,
                                         it.get("created_at", datetime.datetime.now().isoformat())
                                     ))
@@ -612,7 +683,7 @@ class NetworkServer:
                             "synced_ids": synced_ids
                         })
 
-                    
+
                     elif path == "/api/sync/full_import":
                         # استيراد شامل وحفظ في سجل المزامنة المركزي
                         imported_count = 0
@@ -727,16 +798,16 @@ class NetworkClient:
     def __init__(self, server_host: Optional[str] = None, port: Optional[int] = None):
         if server_host:
             self.server_host = server_host.strip()
-            self.port = port or 8050
+            self.port = port or 443
             self.base_url = normalize_server_url(self.server_host, self.port)
         else:
-            self.server_host = AppConfig.get("server_host", "127.0.0.1")
-            self.port = AppConfig.get("server_port", 8050)
+            self.server_host = AppConfig.get("server_host", "onou-server.onrender.com")
+            self.port = AppConfig.get("server_port", 443)
             self.base_url = normalize_server_url(self.server_host, self.port)
 
     def check_connection(self) -> bool:
         try:
-            r = requests.get(f"{self.base_url}/api/status", timeout=AppConfig.get("timeout_seconds", 3.0))
+            r = http_get(f"{self.base_url}/api/status", timeout=AppConfig.get("timeout_seconds", 25.0))
             return r.status_code == 200
         except Exception:
             return False
@@ -745,7 +816,7 @@ class NetworkClient:
         """فحص زمن الاستجابة (Latency) بالمللي ثانية ورسالة الحالة"""
         t0 = datetime.datetime.now()
         try:
-            r = requests.get(f"{self.base_url}/api/status", timeout=AppConfig.get("timeout_seconds", 3.0))
+            r = http_get(f"{self.base_url}/api/status", timeout=AppConfig.get("timeout_seconds", 25.0))
             ms = (datetime.datetime.now() - t0).total_seconds() * 1000.0
             if r.status_code == 200:
                 return (True, ms, "متصل بالسيرفر المركزي بنجاح")
@@ -759,7 +830,7 @@ class NetworkClient:
 
     def login(self, username: str, password: str) -> Dict[str, Any]:
         url = f"{self.base_url}/api/auth/login"
-        r = requests.post(url, json={"username": username, "password": password}, timeout=35.0)
+        r = http_post(url, json={"username": username, "password": password}, timeout=AppConfig.get("timeout_seconds", 35.0))
         if r.status_code == 200:
             return r.json()
         elif r.status_code in (401, 403):
@@ -770,7 +841,7 @@ class NetworkClient:
 
     def get_super_dashboard(self) -> Dict[str, Any]:
         url = f"{self.base_url}/api/directorate/super_dashboard"
-        r = requests.get(url, timeout=10.0)
+        r = http_get(url, timeout=AppConfig.get("timeout_seconds", 25.0))
         if r.status_code == 200:
             return r.json()
         raise ConnectionError(f"تعذر جلب بيانات لوحة التحكم المركزية: {r.status_code}")
