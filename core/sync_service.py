@@ -376,7 +376,7 @@ class SyncWorker(QThread):
                     pushed = 0
                     pulled = 0
 
-                    is_dir_server = self.is_directorate or (AppConfig.get("app_mode") == "DIRECTORATE_SERVER")
+                    is_dir_server = (self.is_directorate or AppConfig.get("app_mode") == "DIRECTORATE_SERVER") and not self.residence_id
 
                     if is_dir_server:
                         # ═══════════════════════════════════════════════════════
