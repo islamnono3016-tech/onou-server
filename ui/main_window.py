@@ -809,10 +809,16 @@ class MainWindow(QMainWindow):
                 self.articles_page.load_articles()
         elif index == (5 + offset):
             if hasattr(self, "entry_page"):
-                self.entry_page.load_vouchers()
+                if hasattr(self.entry_page, "load_vouchers_history"):
+                    self.entry_page.load_vouchers_history()
+                elif hasattr(self.entry_page, "load_vouchers"):
+                    self.entry_page.load_vouchers()
         elif index == (6 + offset):
             if hasattr(self, "exit_page"):
-                self.exit_page.load_vouchers()
+                if hasattr(self.exit_page, "load_history"):
+                    self.exit_page.load_history()
+                elif hasattr(self.exit_page, "load_vouchers"):
+                    self.exit_page.load_vouchers()
         elif index == (7 + offset):
             if hasattr(self, "matrix_page"):
                 self.matrix_page.load_current_tab_data()
@@ -825,6 +831,10 @@ class MainWindow(QMainWindow):
         elif index == (10 + offset):
             if hasattr(self, "bon_commande_page"):
                 self.bon_commande_page.refresh()
+        elif index == (11 + offset):
+            if hasattr(self, "settings_page"):
+                if hasattr(self.settings_page, "load_settings"):
+                    self.settings_page.load_settings()
 
     def mark_pages_dirty(self):
         """عند حدوث تعديل في المخزون أو التذاكر، يتم تعليم الصفحات الأخرى لتحديثها عند زيارتها"""
