@@ -1,5 +1,6 @@
 import sqlite3
 import datetime
+import math
 from typing import List, Dict, Any, Optional
 from database.db_manager import DatabaseManager
 
@@ -68,11 +69,11 @@ class MealsService:
         di_free = int(data.get("di_free", 0))
         di_total = di_stud + di_staf + di_prof + di_gues + di_free
 
-        # 2. حساب معدل الوجبات: =IF(العشاء=0, الغداء, (الغداء + العشاء)/2)
+        # 2. حساب معدل الوجبات بدقة تامة: =IF(العشاء=0, الغداء, (الغداء + العشاء)/2)
         if di_total == 0:
             avg_meals = float(lu_total)
         else:
-            avg_meals = (lu_total + di_total) / 2.0
+            avg_meals = float((lu_total + di_total) / 2.0)
 
         # 3. جلب أو تحديث المصاريف اليومية
         daily_expense = float(data.get("daily_food_expense", 0.0))
@@ -85,10 +86,15 @@ class MealsService:
                 """, (date_str, r_id))
                 daily_expense = float(exp_cur.fetchone()[0])
 
-        # 4. حساب تكلفة وجبة الطالب اليومية: =IF(المعدل=0, 0, (المصاريف / المعدل) / 2)
+        # 4. حساب تكلفة وجبة الطالب اليومية مطابق لـ FC09
         student_cost = 0.0
-        if avg_meals > 0:
-            student_cost = (daily_expense / avg_meals) / 2.0
+        tot_lu_di = lu_total + di_total
+        if di_total > 0 and tot_lu_di > 0:
+            student_cost = daily_expense / float(tot_lu_di)
+        elif lu_total > 0:
+            student_cost = daily_expense / float(lu_total)
+        else:
+            student_cost = 0.0
 
         with self.db.get_connection() as conn:
             conn.execute("""
@@ -137,16 +143,24 @@ class MealsService:
         توليد تقرير النشاط بالأرقام (مكافئ ورقة النشاط بالأرقام)
         يدعم العرض الشهري الافتراضي أو فترة مخصصة من تاريخ إلى تاريخ
         """
+        if isinstance(year, str) and "-" in year:
+            start_date, end_date = year, month
+            year, month = None, None
+
+        if isinstance(year, str) and "-" in year:
+            start_date, end_date = year, month
+            year, month = None, None
+
         r_id = residence_id or self.residence_id
         
         if start_date and end_date:
             d_start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
             d_end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
-            rep_year = year or d_start.year
-            rep_month = month or d_start.month
+            rep_year = int(year) if year else d_start.year
+            rep_month = int(month) if month else d_start.month
         else:
-            rep_year = year or datetime.date.today().year
-            rep_month = month or datetime.date.today().month
+            rep_year = int(year or datetime.date.today().year)
+            rep_month = int(month or datetime.date.today().month)
             if rep_month in [1, 3, 5, 7, 8, 10, 12]: last_day = 31
             elif rep_month in [4, 6, 9, 11]: last_day = 30
             else: last_day = 29 if (rep_year % 4 == 0 and (rep_year % 100 != 0 or rep_year % 400 == 0)) else 28
@@ -180,9 +194,21 @@ class MealsService:
                 bf_c = row["bf_total"] if row else 0
                 lu_c = row["lu_total"] if row else 0
                 di_c = row["di_total"] if row else 0
-                avg_m = row["average_daily_meals"] if row else (lu_c if di_c == 0 else (lu_c + di_c)/2.0)
+
+                # معدل الوجبات بدقة تامة (مثال: 78.5 و 120.5)
+                if di_c == 0:
+                    avg_m = float(lu_c)
+                else:
+                    avg_m = float((lu_c + di_c) / 2.0)
+
                 d_exp = row["daily_food_expense"] if (row and row["daily_food_expense"] > 0) else v_row["tot_exp"]
-                s_cost = row["student_daily_cost"] if row else (0.0 if avg_m == 0 else (d_exp / avg_m) / 2.0)
+                tot_lu_di = lu_c + di_c
+                if di_c > 0 and tot_lu_di > 0:
+                    s_cost = d_exp / float(tot_lu_di)
+                elif lu_c > 0:
+                    s_cost = d_exp / float(lu_c)
+                else:
+                    s_cost = 0.0
 
                 tot_bf_count += bf_c
                 tot_lu_count += lu_c
@@ -204,7 +230,12 @@ class MealsService:
                 })
                 cur_d += datetime.timedelta(days=1)
 
-        avg_student_cost = (tot_expense / ((tot_lu_count + tot_di_count) / 2.0) / 2.0) if (tot_lu_count + tot_di_count) > 0 else 0.0
+        if tot_di_count == 0:
+            tot_avg_all = float(tot_lu_count)
+        else:
+            tot_avg_all = (tot_lu_count + tot_di_count) / 2.0
+
+        avg_student_cost = (tot_expense / tot_avg_all / 2.0) if (tot_avg_all > 0 and tot_di_count > 0) else ((tot_expense / tot_avg_all) if tot_avg_all > 0 else 0.0)
 
         return {
             "year": rep_year,
@@ -230,8 +261,8 @@ class MealsService:
             d_start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
             d_end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
         else:
-            rep_year = year or datetime.date.today().year
-            rep_month = month or datetime.date.today().month
+            rep_year = int(year or datetime.date.today().year)
+            rep_month = int(month or datetime.date.today().month)
             if rep_month in [1, 3, 5, 7, 8, 10, 12]: last_day = 31
             elif rep_month in [4, 6, 9, 11]: last_day = 30
             else: last_day = 29 if (rep_year % 4 == 0 and (rep_year % 100 != 0 or rep_year % 400 == 0)) else 28
