@@ -845,7 +845,7 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------
     def is_directorate_session(self) -> bool:
         """فحص ما إذا كانت الجلسة الحالية تمثل المديرية المركزية (صلاحيات SUPER_ADMIN أو نمط السيرفر)"""
-        is_admin = self.is_directorate_session()
+        is_admin = (self.current_user.get("role") == "SUPER_ADMIN")
         is_server_mode = (AppConfig.get("app_mode") == "DIRECTORATE_SERVER")
         return is_admin or is_server_mode
 
