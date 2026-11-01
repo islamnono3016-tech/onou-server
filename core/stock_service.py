@@ -486,11 +486,11 @@ class StockService:
         if start_date and end_date:
             d_start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
             d_end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
-            rep_year = year or d_start.year
-            rep_month = month or d_start.month
+            rep_year = int(year or d_start.year)
+            rep_month = int(month or d_start.month)
         else:
-            rep_year = year or datetime.date.today().year
-            rep_month = month or datetime.date.today().month
+            rep_year = int(year or datetime.date.today().year)
+            rep_month = int(month or datetime.date.today().month)
             if rep_month in [1, 3, 5, 7, 8, 10, 12]:
                 last_day = 31
             elif rep_month in [4, 6, 9, 11]:
@@ -644,8 +644,8 @@ class StockService:
             d_start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
             d_end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
         else:
-            rep_year = year or datetime.date.today().year
-            rep_month = month or datetime.date.today().month
+            rep_year = int(year or datetime.date.today().year)
+            rep_month = int(month or datetime.date.today().month)
             if rep_month in [1, 3, 5, 7, 8, 10, 12]: last_day = 31
             elif rep_month in [4, 6, 9, 11]: last_day = 30
             else: last_day = 29 if (rep_year % 4 == 0 and (rep_year % 100 != 0 or rep_year % 400 == 0)) else 28
