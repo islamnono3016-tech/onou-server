@@ -58,8 +58,12 @@ class MainWindow(QMainWindow):
         self.auth_svc = AuthService(self.db)
 
         # تحديد الإقامة الابتدائية النشطة
-        if self.current_user.get("residence_id"):
-            self.current_residence_id = self.current_user["residence_id"]
+        user_res_id = self.current_user.get("residence_id")
+        if not user_res_id and self.current_user.get("role") != "SUPER_ADMIN":
+            user_res_id = AppConfig.get("residence_id")
+
+        if user_res_id:
+            self.current_residence_id = int(user_res_id)
             res_row = self.res_svc.get_residence(self.current_residence_id)
             self.current_residence_name = res_row["name"] if res_row else "الإقامة المخصصة"
         else:
@@ -854,10 +858,23 @@ class MainWindow(QMainWindow):
     # إدارة المزامنة والربط الشبكي والاستقلالية التامة
     # -------------------------------------------------------------
     def is_directorate_session(self) -> bool:
-        """فحص ما إذا كانت الجلسة الحالية تمثل المديرية المركزية (صلاحيات SUPER_ADMIN أو نمط السيرفر)"""
-        is_admin = (self.current_user.get("role") == "SUPER_ADMIN")
-        is_server_mode = (AppConfig.get("app_mode") == "DIRECTORATE_SERVER")
-        return is_admin or is_server_mode
+        """
+        فحص ما إذا كانت الجلسة الحالية تمثل المديرية المركزية:
+        - فقط وحصرياً عند تسجيل الدخول بحساب مسؤول النظام المركزي (SUPER_ADMIN وبدون إقامة محددة).
+        - حسابات الإقامات (STOREKEEPER / RESIDENCE_USER أو أي حساب بـ residence_id محدد) هي جلسة إقامة دائماً.
+        """
+        if not hasattr(self, "current_user") or not self.current_user:
+            return False
+
+        res_id = self.current_user.get("residence_id")
+        if res_id is not None and str(res_id).strip() not in ("", "0", "None"):
+            return False
+
+        role = str(self.current_user.get("role") or "").upper()
+        if role in ("STOREKEEPER", "RESIDENCE_USER"):
+            return False
+
+        return role == "SUPER_ADMIN"
 
     def init_sync_worker(self):
         """
