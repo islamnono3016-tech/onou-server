@@ -1,4 +1,4 @@
-﻿import uuid
+import uuid
 import json
 import logging
 import datetime
@@ -187,7 +187,7 @@ class SyncService:
             return 0
 
         # المديرية فقط في وضع الخادم ومع تصريح المديرية هي من يملك صلاحية السحب
-        is_true_directorate = (cfg_mode == "DIRECTORATE_SERVER") and (is_directorate or getattr(self, "is_directorate", False))
+        is_true_directorate = (cfg_mode == "DIRECTORATE_SERVER") or is_directorate or getattr(self, "is_directorate", False)
         if not is_true_directorate:
             logger.info("🚫 سحب البيانات محظور: السحب متاح لمركز قيادة المديرية المركزية فقط.")
             return 0
@@ -271,6 +271,12 @@ class SyncService:
 
             latest_id = data.get("latest_id", last_id)
             self.db.set_setting("last_pulled_sync_event_id", str(latest_id))
+            if applied_count > 0:
+                try:
+                    from core.cache_service import CacheService
+                    CacheService.invalidate_all()
+                except Exception:
+                    pass
             logger.info(f"Pulled and applied {applied_count} sync events (latest ID: {latest_id})")
             return applied_count
         except Exception as e:
@@ -370,7 +376,7 @@ class SyncWorker(QThread):
                     pushed = 0
                     pulled = 0
 
-                    is_dir_server = (AppConfig.get("app_mode") == "DIRECTORATE_SERVER") and (not AppConfig.get("residence_id") or AppConfig.get("residence_id") == 0) and self.is_directorate
+                    is_dir_server = self.is_directorate or (AppConfig.get("app_mode") == "DIRECTORATE_SERVER")
 
                     if is_dir_server:
                         # ═══════════════════════════════════════════════════════
@@ -378,7 +384,7 @@ class SyncWorker(QThread):
                         # ═══════════════════════════════════════════════════════
                         pulled = self.sync_svc.pull_updates(residence_id=None, is_directorate=True)
                         if pulled > 0:
-                            self.new_residence_data_received.emit(0)
+                            self.new_residence_data_received.emit(pulled)
 
                         # وفي حال تم تسجيل أي حركة في المديرية، تُرسل أيضاً
                         pending_cnt = self.sync_svc.get_pending_count(None)
@@ -407,7 +413,7 @@ class SyncWorker(QThread):
             # الإقامات تتحقق كل 10 ثواني لإرسال ما تراكم في الرتل
             # المديرية تتحقق كل ثانيتين لسحب بيانات الإقامات بمجرد حفظها فوراً
             # الإقامات تتحقق كل 4 ثوانٍ لإرسال أي حركات معلقة
-            interval = max(5, AppConfig.get("sync_interval_seconds", 5))
+            interval = 3 if is_dir_server else max(4, AppConfig.get("sync_interval_seconds", 5))
             for _ in range(max(1, interval)):
                 if not self.is_running:
                     break
