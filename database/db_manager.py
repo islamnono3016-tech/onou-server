@@ -18,6 +18,68 @@ else:
 
 DEFAULT_DB_PATH = os.path.join(BASE_DIR, "data", "catering_stock.db")
 
+
+class SmartRow:
+    """
+    صف ذكي فائق التوافق يجمع بين مزايا sqlite3.Row و Python dict:
+    - يدعم الفهرسة الرقمية: row[0], row[1] (يمنع أخطاء KeyError: 0)
+    - يدعم الفهرسة النصية: row['name'], row['residence_id']
+    - يدعم التابع الآمن: row.get('col', default)
+    - يدعم التحويل المباشر: dict(row), tuple(row), list(row)
+    - يدعم دوال المعاجم: row.keys(), row.values(), row.items()
+    """
+    __slots__ = ("_cols", "_data")
+
+    def __init__(self, cursor: sqlite3.Cursor, row: tuple):
+        self._cols = {col[0]: idx for idx, col in enumerate(cursor.description)}
+        self._data = row
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._data[key]
+        idx = self._cols.get(key)
+        if idx is not None:
+            return self._data[idx]
+        key_str = str(key).lower()
+        for col_name, c_idx in self._cols.items():
+            if col_name.lower() == key_str:
+                return self._data[c_idx]
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except (KeyError, IndexError, TypeError):
+            return default
+
+    def keys(self):
+        return list(self._cols.keys())
+
+    def values(self):
+        return list(self._data)
+
+    def items(self):
+        return [(k, self._data[idx]) for k, idx in self._cols.items()]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __contains__(self, key):
+        if key in self._cols:
+            return True
+        key_str = str(key).lower()
+        return any(c.lower() == key_str for c in self._cols)
+
+    def __repr__(self):
+        return f"<SmartRow {dict(self.items())}>"
+
+
+def _dict_row_factory(cursor: sqlite3.Cursor, row: tuple):
+    return SmartRow(cursor, row)
+
 class ManagedConnection:
     """مغلف لاتصال SQLite يضمن الالتزام بالمعاملات وإغلاق الاتصال تلقائياً فور الانتهاء"""
     def __init__(self, conn: sqlite3.Connection):
@@ -60,7 +122,7 @@ class DatabaseManager:
 
     def get_connection(self):
         conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
+        conn.row_factory = _dict_row_factory   # كل الصفوف تُعاد كـ dict يدعم .get() بأمان
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute("PRAGMA synchronous = NORMAL;")
         conn.execute("PRAGMA cache_size = -64000;")      # 64MB cache
@@ -71,7 +133,7 @@ class DatabaseManager:
     def init_database(self):
         """إنشاء الجداول وترقيتها وتطبيق الفهارس المتقدمة وضبط إعدادات السرعة الفائقة"""
         conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
+        conn.row_factory = SmartRow
         try:
             # تفعيل نمط WAL للسرعة ودعم القراءة والكتابة المتزامنة
             conn.execute("PRAGMA journal_mode = WAL;")
@@ -90,7 +152,7 @@ class DatabaseManager:
             # التحقق من رقم إصدار البنية لتخطي الفحوصات المتكررة عند كل تشغيل (0 ميلي ثانية)
             ver_cur = conn.execute("SELECT value FROM settings WHERE key='schema_version'")
             ver_row = ver_cur.fetchone()
-            if ver_row and ver_row["value"] == "2026.10.22":
+            if ver_row and ver_row["value"] == "2026.11.03":
                 return
 
             # 2. ترقية الأعمدة الناقصة لجميع الجداول بأمان (Safe Schema Migration)
@@ -115,11 +177,17 @@ class DatabaseManager:
             self._migrate_residence_loans(conn)
             # 2.3 ترقية وإنشاء جدول الأيام المرخصة استثنائياً من المديرية
             self._migrate_unlocked_days(conn)
+            # 2.4 تطبيق التقريب العلوي لمعدل الوجبات (78.5 -> 79, 120.5 -> 121)
+            self._migrate_round_up_meals(conn)
+            # 2.5 نقل قيم توريد 01/09/2026 إلى عمود مخزون أول مدة فقط لجميع الإقامات
+            self._migrate_0901_supply_to_initial_stock(conn)
+            # 2.6 بذر وترحيل بيانات الإقامة الجامعية حساني محمد بن إبراهيم (RES-04)
+            self._migrate_residence_4_data(conn)
 
             # بذر الإعدادات الافتراضية
             default_settings = [
                 ("residence_name", "الإقامة الجامعية محمد الطاهر العبيدي بورقلة", "اسم الإقامة الجامعية"),
-                ("directorate_name", "مديرية الخدمات الجامعية بورقلة", "اسم المديرية التابعة لها"),
+                ("directorate_name", "مديرية الخدمات الجامعية ورقلة قطب", "اسم المديرية التابعة لها"),
                 ("onou_name", "الديوان الوطني للخدمات الجامعية", "اسم الديوان الوطني"),
                 ("academic_year", "2026", "السنة المالية / الجامعية الحالية"),
                 ("cost_calculation_mode", "FIXED", "طريقة حساب تكلفة المخزون: FIXED (السعر التعاقدي) أو PMP (التكلفة المتوسطة المرجحة)"),
@@ -131,6 +199,12 @@ class DatabaseManager:
                     "INSERT OR IGNORE INTO settings (key, value, description) VALUES (?, ?, ?)",
                     (key, val, desc)
                 )
+
+            # تحديث اسم المديرية تلقائياً إلى التسمية الرسمية الجديدة: ورقلة قطب
+            conn.execute("""
+                UPDATE settings SET value = 'مديرية الخدمات الجامعية ورقلة قطب'
+                WHERE key = 'directorate_name' AND (value LIKE '%بورقلة%' OR value = 'مديرية الخدمات الجامعية ورقلة');
+            """)
 
             # بذر الفئات الأساسية للمواد
             default_categories = [
@@ -149,13 +223,39 @@ class DatabaseManager:
 
             # بذر المستخدم الإداري الافتراضي في حالة قاعدة بيانات جديدة
             u_cnt = conn.execute("SELECT COUNT(*) as cnt FROM users").fetchone()
+            from core.auth_service import AuthService
+            admin_hash = AuthService.hash_password("admin123")
             if u_cnt and u_cnt["cnt"] == 0:
-                from core.auth_service import AuthService
-                admin_hash = AuthService.hash_password("admin123")
                 conn.execute(
                     "INSERT INTO users (username, password_hash, full_name, role, is_active) VALUES (?, ?, ?, ?, 1)",
                     ("admin", admin_hash, "مدير الخدمات الجامعية (مسؤول النظام)", "SUPER_ADMIN")
                 )
+            
+            # ضمان وجود هاش كود المديرية في جدول settings ومطابقته للمدير العام
+            admin_row = conn.execute("SELECT password_hash FROM users WHERE role = 'SUPER_ADMIN' OR LOWER(username) = 'admin' LIMIT 1").fetchone()
+            current_admin_hash = admin_row["password_hash"] if admin_row else admin_hash
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value, description) VALUES ('directorate_code_hash', ?, 'كود التحقق الأمني الموحد لمديرية الخدمات')",
+                (current_admin_hash,)
+            )
+
+            # بذر الإقامات الرسمية إذا كان الجدول فارغاً
+            r_cnt = conn.execute("SELECT COUNT(*) as cnt FROM residences").fetchone()
+            if r_cnt and r_cnt["cnt"] == 0:
+                default_residences = [
+                    (1, "RES-01", "الإقامة الجامعية بن الشيخ التلي", "ورقلة", "مدير الإقامة", 1000),
+                    (2, "RES-02", "الإقامة الجامعية بن دحمان بشير", "ورقلة", "مدير الإقامة", 2000),
+                    (3, "RES-03", "الإقامة الجامعية بن مالك محمد حسان", "ورقلة", "مدير الإقامة", 1000),
+                    (4, "RES-04", "الإقامة الجامعية حساني محمد بن إبراهيم", "ورقلة", "مدير الإقامة", 1000),
+                    (5, "RES-05", "الإقامة الجامعية قربشي محمد الناجي", "ورقلة", "مدير الإقامة", 1000),
+                    (6, "RES-06", "الإقامة الجامعية لخضاري محمد الأخضر", "ورقلة", "مدير الإقامة", 1000),
+                    (7, "RES-07", "الإقامة الجامعية محمد الطاهر العبيدي", "ورقلة", "مدير الإقامة", 1500),
+                ]
+                for rid, code, name, city, dname, cap in default_residences:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO residences (id, code, name, city, director_name, capacity, is_active)
+                        VALUES (?, ?, ?, ?, ?, ?, 1)
+                    """, (rid, code, name, city, dname, cap))
 
             # 3. إنشاء الفهارس المركبة لتسريع البحث والتقارير الفورية بنسبة 1000%
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mov_res_date_art ON stock_movements(residence_id, date, article_id);")
@@ -168,7 +268,33 @@ class DatabaseManager:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_xvi_voucher_art ON exit_voucher_items(voucher_id, article_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ra_res_art ON residence_articles(residence_id, article_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_art_active_cat ON articles(is_active, category_id);")
-            conn.execute("INSERT OR REPLACE INTO settings (key, value, description) VALUES ('schema_version', '2026.10.22', 'إصدار بنية قاعدة البيانات');")
+
+            # 4. إنشاء جداول بونات الطلب (Bons de Commande)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bon_commande (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    residence_id INTEGER NOT NULL,
+                    lot_index INTEGER NOT NULL,
+                    bon_number TEXT DEFAULT '',
+                    period_label TEXT DEFAULT '',
+                    period_start TEXT DEFAULT '',
+                    period_end TEXT DEFAULT '',
+                    created_at TEXT DEFAULT (datetime('now','localtime')),
+                    updated_at TEXT DEFAULT (datetime('now','localtime')),
+                    UNIQUE(residence_id, lot_index)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bon_commande_qty (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bon_id INTEGER NOT NULL REFERENCES bon_commande(id) ON DELETE CASCADE,
+                    product_num INTEGER NOT NULL,
+                    col_index INTEGER NOT NULL,
+                    quantity REAL DEFAULT 0,
+                    UNIQUE(bon_id, product_num, col_index)
+                )
+            """)
+            conn.execute("INSERT OR REPLACE INTO settings (key, value, description) VALUES ('schema_version', '2026.11.03', 'إصدار بنية قاعدة البيانات');")
             conn.commit()
         finally:
             conn.close()
@@ -392,6 +518,81 @@ class DatabaseManager:
             logger.info("Unlocked days table and index verified successfully.")
         except Exception as e:
             logger.error(f"Error migrating unlocked days table: {e}")
+
+    @staticmethod
+    def _migrate_round_up_meals(conn: sqlite3.Connection):
+        """تطبيق التقريب العلوي على معدلات الوجبات المسجلة سابقاً (78.5 -> 79, 120.5 -> 121)"""
+        try:
+            conn.execute("""
+                UPDATE daily_meals_tracking
+                SET average_daily_meals = ROUND(average_daily_meals + 0.499999)
+                WHERE average_daily_meals > 0 
+                  AND average_daily_meals != CAST(average_daily_meals AS INTEGER);
+            """)
+            conn.commit()
+            logger.info("Daily meals tracking round-up migration completed successfully.")
+        except Exception as e:
+            logger.error(f"Error in round-up meals migration: {e}")
+
+    @staticmethod
+    def _migrate_0901_supply_to_initial_stock(conn: sqlite3.Connection):
+        """
+        نقل قيم التوريد المسجلة بتاريخ 01/09/2026 إلى عمود مخزون أول مدة فقط لجميع الإقامات،
+        وحذفها من التوريدات لتكون معتمدة كمخزون بداية السنة الدراسية / المالية.
+        """
+        try:
+            cur = conn.execute("""
+                SELECT ev.id, ev.voucher_number, ev.residence_id
+                FROM entry_vouchers ev
+                WHERE ev.date = '2026-09-01' AND ev.voucher_type = 'SUPPLIER'
+            """)
+            vouchers = cur.fetchall()
+            if not vouchers:
+                return
+
+            for v in vouchers:
+                v_id = v["id"]
+                r_id = v["residence_id"]
+                items = conn.execute("""
+                    SELECT evi.article_id, evi.quantity, evi.unit_price_ttc
+                    FROM entry_voucher_items evi
+                    WHERE evi.voucher_id = ?
+                """, (v_id,)).fetchall()
+
+                for it in items:
+                    art_id = it["article_id"]
+                    qty = float(it["quantity"] or 0.0)
+                    price = float(it["unit_price_ttc"] or 0.0)
+                    if qty <= 0:
+                        continue
+
+                    conn.execute("""
+                        INSERT INTO residence_articles (residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp)
+                        VALUES (?, ?, ?, ?, 10.0, ?)
+                        ON CONFLICT(residence_id, article_id) DO UPDATE SET
+                            initial_stock = initial_stock + excluded.initial_stock
+                    """, (r_id, art_id, qty, qty, price))
+
+                    if r_id == 1:
+                        conn.execute("UPDATE articles SET initial_stock = initial_stock + ? WHERE id = ?", (qty, art_id))
+
+                conn.execute("DELETE FROM entry_voucher_items WHERE voucher_id = ?", (v_id,))
+                conn.execute("DELETE FROM entry_vouchers WHERE id = ?", (v_id,))
+                conn.execute("DELETE FROM stock_movements WHERE voucher_id = ? AND movement_type = 'SUPPLY_IN' AND residence_id = ?", (v_id, r_id))
+
+            conn.commit()
+            logger.info("Successfully migrated 01/09/2026 supply values to initial_stock for all residences.")
+        except Exception as e:
+            logger.error(f"Error in _migrate_0901_supply_to_initial_stock: {e}")
+
+    @staticmethod
+    def _migrate_residence_4_data(conn: sqlite3.Connection):
+        """ترحيل وبذر كافة بيانات الإقامة الجامعية حساني محمد بن إبراهيم (RES-04) لشهر سبتمبر وأكتوبر 2026"""
+        try:
+            from database.seed_residence_4_data import seed_residence_4
+            seed_residence_4(conn)
+        except Exception as e:
+            logger.error(f"Error in _migrate_residence_4_data: {e}")
 
     def get_setting(self, key: str, default: str = "") -> str:
 
