@@ -1012,15 +1012,26 @@ class MainWindow(QMainWindow):
             logger.error(f"Error in on_new_residence_data: {e}")
 
     def on_residence_data_pulled(self, r_id: int):
-        """يُستدعى عند نجاح سحب واسترجاع بيانات الإقامة لتحديث الواجهة فورياً"""
+        """يُستدعى عند نجاح سحب واسترجاع بيانات الإقامة لتحديث الواجهة فورياً والتحويل التلقائي للإقامة المسترجعة"""
         try:
             from core.cache_service import CacheService
             CacheService.invalidate_all()
         except Exception:
             pass
         self.dirty_pages = set(range(self.stack.count()))
-        if hasattr(self, "current_residence_id") and self.current_residence_id == r_id:
-            self.set_active_residence(self.current_residence_id, self.current_residence_name)
+
+        r_name = ""
+        try:
+            res_row = self.res_svc.get_residence(r_id)
+            if res_row and res_row.get("name"):
+                r_name = res_row["name"]
+        except Exception:
+            pass
+        if not r_name:
+            r_name = f"الإقامة {r_id}"
+
+        # تبديل الإقامة النشطة فورياً للإقامة المسحوبة حتى تظهر كافة سجلاتها ومخزونها أمام المستخدم مباشرة
+        self.set_active_residence(r_id, r_name)
         self.refresh_current_page_data()
 
     def update_sync_ui(self, is_online: bool):

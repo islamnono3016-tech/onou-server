@@ -40,12 +40,38 @@ class PullResidenceWorker(QThread):
 
     def run(self):
         try:
+            import os
+            import logging
+            _logger = logging.getLogger(__name__)
             from core.sync_service import SyncService
             sync_svc = SyncService(self.db)
+
             if self.from_db_path:
                 res = sync_svc.restore_residence_from_db_file(self.residence_id, self.from_db_path)
             else:
+                # 1. المحاولة الأولى: سحب عبر الشبكة أو السحاب
                 res = sync_svc.pull_full_residence_data(self.residence_id)
+
+                # 2. في حال فشل الاتصال بالشبكة (أوفلاين أو انقطاع أو مهلة)، السحب التلقائي من قاعدة البيانات الرسمية
+                if not res.get("success"):
+                    _logger.warning(f"Online pull failed ({res.get('error')}), initiating smart offline fallback...")
+                    candidates = [
+                        r"H:\official_catering_stock.db",
+                        r"H:\catering_stock.db",
+                        os.path.join(r"C:\Users\pc\AppData\Local\CateringStockONOU", "database", "official_catering_stock.db"),
+                        r"H:\pyinstaller_dist\CateringStockONOU\database\official_catering_stock.db",
+                        r"H:\CateringStockONOU\data\catering_stock.db",
+                        r"C:\Users\pc\Desktop\official_catering_stock.db",
+                        r"C:\Users\pc\Desktop\catering_stock.db"
+                    ]
+                    for cand in candidates:
+                        if os.path.exists(cand) and os.path.getsize(cand) > 1000000:
+                            fb_res = sync_svc.restore_residence_from_db_file(self.residence_id, cand)
+                            if fb_res.get("success"):
+                                fb_res["source_mode"] = "OFFLINE_FALLBACK"
+                                fb_res["source_file"] = cand
+                                res = fb_res
+                                break
 
             if res.get("success"):
                 self.finished.emit(res)
@@ -110,11 +136,26 @@ class SettingsWidget(QWidget):
             pass
         return f"الإقامة {r_id}"
 
+    def get_selected_pull_residence_id(self) -> int:
+        if hasattr(self, 'cmb_pull_residence') and self.cmb_pull_residence.currentData():
+            return int(self.cmb_pull_residence.currentData())
+        return self.get_target_residence_id()
+
+    def get_selected_pull_residence_name(self, r_id: int) -> str:
+        if hasattr(self, 'cmb_pull_residence') and self.cmb_pull_residence.currentData() == r_id:
+            txt = self.cmb_pull_residence.currentText()
+            return txt.split(" (معرف")[0] if " (معرف" in txt else txt
+        return self.get_target_residence_name(r_id)
+
     def set_residence(self, residence_id: int, residence_name: Optional[str] = None):
         self.residence_id = residence_id
-        if hasattr(self, 'lbl_pull_res_target'):
-            r_name = residence_name or self.get_target_residence_name(residence_id)
-            self.lbl_pull_res_target.setText(f"🏢 الإقامة المستهدفة بالسحب: {r_name} (رقم: {residence_id})")
+        if hasattr(self, 'cmb_pull_residence'):
+            self.cmb_pull_residence.blockSignals(True)
+            for idx in range(self.cmb_pull_residence.count()):
+                if self.cmb_pull_residence.itemData(idx) == residence_id:
+                    self.cmb_pull_residence.setCurrentIndex(idx)
+                    break
+            self.cmb_pull_residence.blockSignals(False)
 
 
     def init_ui(self):
@@ -553,44 +594,71 @@ class SettingsWidget(QWidget):
         pp_card_l = QVBoxLayout(pp_card)
         pp_card_l.setSpacing(10)
 
-        # بطاقة تعريف الإقامة المستهدفة
-        curr_t_id = self.get_target_residence_id()
-        curr_t_name = self.get_target_residence_name(curr_t_id)
-        self.lbl_pull_res_target = QLabel(f"🏢 الإقامة المستهدفة بالسحب: {curr_t_name} (رقم: {curr_t_id})")
-        self.lbl_pull_res_target.setStyleSheet(
-            "font-size: 13px; font-weight: bold; color: #38BDF8; "
-            "background-color: rgba(14, 165, 233, 0.15); "
-            "padding: 6px 12px; border-radius: 6px; border: 1px solid rgba(14, 165, 233, 0.4);"
+        # اختيار الإقامة المستهدفة بالسحب عبر قائمة منسدلة واضحة
+        res_sel_layout = QHBoxLayout()
+        res_sel_layout.setSpacing(10)
+        lbl_res_sel = QLabel("🏢 اختر الإقامة المراد سحب واسترجاع كافة بياناتها من المديرية:")
+        lbl_res_sel.setStyleSheet("color: #F8FAFC; font-weight: bold; font-size: 13px;")
+        res_sel_layout.addWidget(lbl_res_sel)
+
+        self.cmb_pull_residence = QComboBox()
+        self.cmb_pull_residence.setStyleSheet(
+            "background-color: #0F172A; color: #38BDF8; font-weight: bold; font-size: 13px; "
+            "border: 1.5px solid #0EA5E9; padding: 6px 14px; border-radius: 6px;"
         )
-        pp_card_l.addWidget(self.lbl_pull_res_target)
+        curr_t_id = self.get_target_residence_id()
+        try:
+            with self.db.get_connection() as conn:
+                res_rows = conn.execute("SELECT id, name, code FROM residences ORDER BY id ASC").fetchall()
+                for r in res_rows:
+                    self.cmb_pull_residence.addItem(f"{r['name']} (معرف رقم: {r['id']})", r['id'])
+        except Exception:
+            pass
+
+        for idx in range(self.cmb_pull_residence.count()):
+            if self.cmb_pull_residence.itemData(idx) == curr_t_id:
+                self.cmb_pull_residence.setCurrentIndex(idx)
+                break
+
+        res_sel_layout.addWidget(self.cmb_pull_residence)
+        pp_card_l.addLayout(res_sel_layout)
 
         # التنبيه والإيضاح
         lbl_pull_desc = QLabel(
-            "تتيح هذه الخاصية سحب واسترجاع كافة البيانات التاريخية لهذه الإقامة دفعة واحدة من قاعدة بيانات المديرية "
+            "تتيح هذه الخاصية سحب واسترجاع كافة البيانات التاريخية للإقامة المحددة أعلاه دفعة واحدة من قاعدة بيانات المديرية "
             "(وصولات الدخول، وصولات الخروج، بطاقات اليومية للوجبات، حركات المخزون، وأرصدة المواد).\n"
-            "🔒 العملية يدوية تماماً ومحمية بنظام العزل التام: لا تمس ولا تسحب أي بيانات تخص الإقامات الأخرى إطلاقاً."
+            "🔒 العملية يدوية تماماً وتتمتع بنظام العزل التام: لا تمس ولا تسحب أي بيانات تخص الإقامات الأخرى إطلاقاً."
         )
         lbl_pull_desc.setStyleSheet("color: #E2E8F0; font-size: 11px; line-height: 1.4;")
         lbl_pull_desc.setWordWrap(True)
         pp_card_l.addWidget(lbl_pull_desc)
 
-        # أزرار السحب
+        # أزرار السحب الثلاثية (سحابي ذكي + أوفلاين فوري + ملف مخصص)
         btn_box = QHBoxLayout()
         btn_box.setSpacing(10)
 
         self.btn_pull_residence = QPushButton("📥 سحب جميع بيانات إقامتي من بيانات المديرية (سحابي / محلي)")
         self.btn_pull_residence.setStyleSheet(
             "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0284C7, stop:1 #0EA5E9); "
-            "color: #FFFFFF; font-weight: bold; padding: 10px 18px; border-radius: 6px; font-size: 13px;"
+            "color: #FFFFFF; font-weight: bold; padding: 10px 16px; border-radius: 6px; font-size: 12px;"
         )
         self.btn_pull_residence.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_pull_residence.clicked.connect(self.on_pull_residence_clicked)
         btn_box.addWidget(self.btn_pull_residence)
 
-        self.btn_pull_res_file = QPushButton("📂 سحب من ملف قاعدة بيانات المديرية (USB)")
+        self.btn_pull_instant_offline = QPushButton("⚡ استرجاع فوري لبيانات الإقامة (أوفلاين بدون إنترنت)")
+        self.btn_pull_instant_offline.setStyleSheet(
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #10B981); "
+            "color: #FFFFFF; font-weight: bold; padding: 10px 16px; border-radius: 6px; font-size: 12px;"
+        )
+        self.btn_pull_instant_offline.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_pull_instant_offline.clicked.connect(self.on_pull_instant_offline_clicked)
+        btn_box.addWidget(self.btn_pull_instant_offline)
+
+        self.btn_pull_res_file = QPushButton("📂 اختيار ملف DB (USB)")
         self.btn_pull_res_file.setStyleSheet(
             "background-color: #1E293B; border: 1px solid #475569; color: #CBD5E1; "
-            "font-weight: bold; padding: 10px 14px; border-radius: 6px; font-size: 12px;"
+            "font-weight: bold; padding: 10px 12px; border-radius: 6px; font-size: 11px;"
         )
         self.btn_pull_res_file.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_pull_res_file.clicked.connect(self.on_pull_residence_from_file_clicked)
@@ -983,8 +1051,8 @@ class SettingsWidget(QWidget):
 
 
     def on_pull_residence_clicked(self):
-        r_id = self.get_target_residence_id()
-        r_name = self.get_target_residence_name(r_id)
+        r_id = self.get_selected_pull_residence_id()
+        r_name = self.get_selected_pull_residence_name(r_id)
 
         reply = QMessageBox.question(
             self,
@@ -994,7 +1062,7 @@ class SettingsWidget(QWidget):
             f"⚠️ ملاحظة هامة:\n"
             f"• سيتم سحب واسترجاع كافة وصولات الدخول والخروج وبطاقات اليومية للوجبات وحركات المخزون الخاصة بإقامتك حصراً.\n"
             f"• لن تتأثر أي إقامة أخرى إطلاقاً بفضل نظام العزل التام.\n"
-            f"• سيتم استبدال البيانات المحلية الخاصة بإقامتك بالبيانات المعتمدة لدى المديرية.\n\n"
+            f"• يدعم النظام السحب عبر الشبكة/السحاب مع التحويل التلقائي الذكي لقاعدة البيانات الرسمية في حال انقطاع الإنترنت.\n\n"
             f"هل أنت متأكد من رغبتك في سحب البيانات الآن؟",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
@@ -1004,7 +1072,9 @@ class SettingsWidget(QWidget):
             return
 
         self.btn_pull_residence.setEnabled(False)
-        self.lbl_pull_status.setText(f"⏳ جاري الاتصال بسيرفر المديرية وسحب بيانات {r_name} دفعة واحدة...")
+        if hasattr(self, 'btn_pull_instant_offline'):
+            self.btn_pull_instant_offline.setEnabled(False)
+        self.lbl_pull_status.setText(f"⏳ جاري فحص الاتصال وسحب بيانات {r_name} دفعة واحدة...")
         self.lbl_pull_status.setStyleSheet("color: #F59E0B; font-weight: bold; font-size: 12px;")
 
         self.pull_worker = PullResidenceWorker(r_id, self.db, from_db_path=None, parent=self)
@@ -1012,9 +1082,60 @@ class SettingsWidget(QWidget):
         self.pull_worker.error.connect(self._on_pull_error)
         self.pull_worker.start()
 
+    def on_pull_instant_offline_clicked(self):
+        r_id = self.get_selected_pull_residence_id()
+        r_name = self.get_selected_pull_residence_name(r_id)
+
+        reply = QMessageBox.question(
+            self,
+            "استرجاع فوري لبيانات الإقامة (أوفلاين بدون إنترنت)",
+            f"هل تريد استرجاع جميع بيانات إقامتك فوراً من قاعدة البيانات الرسمية المعتمدة (أوفلاين بدون إنترنت)؟\n\n"
+            f"🏢 الإقامة المعنية: {r_name} (رقم: {r_id})\n\n"
+            f"⚡ سيتم استخراج وتطبيق كافة السجلات الخاصة بإقامتك حصراً من النسخة المعتمدة.\n\n"
+            f"هل تود المتابعة الآن؟",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        import os
+        candidates = [
+            r"H:\official_catering_stock.db",
+            r"H:\catering_stock.db",
+            os.path.join(r"C:\Users\pc\AppData\Local\CateringStockONOU", "database", "official_catering_stock.db"),
+            r"H:\pyinstaller_dist\CateringStockONOU\database\official_catering_stock.db",
+            r"C:\Users\pc\Desktop\official_catering_stock.db",
+            r"C:\Users\pc\Desktop\catering_stock.db",
+            r"H:\CateringStockONOU\data\catering_stock.db"
+        ]
+        target_db = None
+        for cand in candidates:
+            if os.path.exists(cand) and os.path.getsize(cand) > 1000000:
+                target_db = cand
+                break
+
+        if not target_db:
+            QMessageBox.warning(
+                self,
+                "الملف غير موجود",
+                "لم يتم العثور على ملف قاعدة البيانات الرسمية على الفلاش ديسك H:\\ أو في مجلد البرنامج.\nيرجى التأكد من وصل الفلاش ديسك أو اختيار الملف يدوياً."
+            )
+            return
+
+        self.btn_pull_residence.setEnabled(False)
+        self.btn_pull_instant_offline.setEnabled(False)
+        self.lbl_pull_status.setText(f"⏳ جاري الاسترجاع الفوري لبيانات {r_name} من الملف المعتمد...")
+        self.lbl_pull_status.setStyleSheet("color: #10B981; font-weight: bold; font-size: 12px;")
+
+        self.pull_worker = PullResidenceWorker(r_id, self.db, from_db_path=target_db, parent=self)
+        self.pull_worker.finished.connect(self._on_pull_finished)
+        self.pull_worker.error.connect(self._on_pull_error)
+        self.pull_worker.start()
+
     def on_pull_residence_from_file_clicked(self):
-        r_id = self.get_target_residence_id()
-        r_name = self.get_target_residence_name(r_id)
+        r_id = self.get_selected_pull_residence_id()
+        r_name = self.get_selected_pull_residence_name(r_id)
 
         default_dir = "H:\\" if os.path.exists("H:\\") else os.getcwd()
         db_file, _ = QFileDialog.getOpenFileName(
@@ -1040,7 +1161,9 @@ class SettingsWidget(QWidget):
             return
 
         self.btn_pull_residence.setEnabled(False)
-        self.lbl_pull_status.setText(f"⏳ جاري قراءة واسترجاع بيانات {r_name} من الملف المحلي...")
+        if hasattr(self, 'btn_pull_instant_offline'):
+            self.btn_pull_instant_offline.setEnabled(False)
+        self.lbl_pull_status.setText(f"⏳ جاري قراءة واسترجاع بيانات {r_name} من الملف المختار...")
         self.lbl_pull_status.setStyleSheet("color: #F59E0B; font-weight: bold; font-size: 12px;")
 
         self.pull_worker = PullResidenceWorker(r_id, self.db, from_db_path=db_file, parent=self)
@@ -1049,17 +1172,24 @@ class SettingsWidget(QWidget):
         self.pull_worker.start()
 
     def _on_pull_finished(self, res: dict):
-        self.btn_pull_residence.setEnabled(True)
+        if hasattr(self, 'btn_pull_residence'):
+            self.btn_pull_residence.setEnabled(True)
+        if hasattr(self, 'btn_pull_instant_offline'):
+            self.btn_pull_instant_offline.setEnabled(True)
+
         r_id = res.get("residence_id", 0)
         r_name = res.get("residence_name", "الإقامة")
         counts = res.get("counts", {})
+        source_mode = res.get("source_mode", "ONLINE")
 
-        self.lbl_pull_status.setText(f"✅ تم سحب واسترجاع جميع بيانات {r_name} بنجاح!")
+        mode_text = " (عبر خادم المديرية الشبكي)" if source_mode == "ONLINE" else " (من قاعدة البيانات الرسمية المعتمدة - أوفلاين)"
+        self.lbl_pull_status.setText(f"✅ تم سحب واسترجاع جميع بيانات {r_name} بنجاح!{mode_text}")
         self.lbl_pull_status.setStyleSheet("color: #10B981; font-weight: bold; font-size: 12px;")
 
         details = (
             f"✅ تم سحب واسترجاع جميع بيانات إقامتك من بيانات المديرية بنجاح!\n\n"
-            f"🏢 الإقامة المسترجعة: {r_name}\n\n"
+            f"🏢 الإقامة المسترجعة: {r_name} (رقم: {r_id})\n"
+            f"🌐 طريقة السحب: {mode_text.strip()}\n\n"
             f"📊 إحصائيات البيانات المسترجعة:\n"
             f"  • أوراق الوجبات اليومية: {counts.get('daily_meals_tracking', 0)} ورقة\n"
             f"  • وصولات الدخول: {counts.get('entry_vouchers', 0)} وصل ({counts.get('entry_voucher_items', 0)} مادة)\n"
@@ -1069,22 +1199,24 @@ class SettingsWidget(QWidget):
             f"  • الإعارات والاستعارات: {counts.get('residence_loans', 0)} إعارة\n"
             f"  • محاضر الجرد: {counts.get('inventory_snapshots', 0)} محضر\n"
             f"  • حصص الممونين: {counts.get('supplier_allocations', 0)} حصة\n\n"
-            f"🔒 ملاحظة: تم عزل البيانات بنسبة 100%، ولم يتم المساس بأي إقامة أخرى."
+            f"🔒 تم تحويل الواجهة فوراً للإقامة المسترجعة مع عزل تام 100% لباقي الإقامات."
         )
 
         QMessageBox.information(self, "نجاح سحب البيانات من المديرية", details)
         self.residence_data_pulled.emit(r_id)
 
     def _on_pull_error(self, err_msg: str):
-        self.btn_pull_residence.setEnabled(True)
+        if hasattr(self, 'btn_pull_residence'):
+            self.btn_pull_residence.setEnabled(True)
+        if hasattr(self, 'btn_pull_instant_offline'):
+            self.btn_pull_instant_offline.setEnabled(True)
         self.lbl_pull_status.setText(f"❌ تعذر السحب: {err_msg}")
         self.lbl_pull_status.setStyleSheet("color: #EF4444; font-weight: bold; font-size: 12px;")
 
         QMessageBox.warning(
             self,
             "تعذر سحب البيانات",
-            f"تعذر إتمام سحب بيانات الإقامة من المديرية:\n{err_msg}\n\n"
-            f"💡 إرشاد:\n"
-            f"1. تأكد من اتصال الجهاز بالإنترنت أو بالشبكة المحلية للمديرية.\n"
-            f"2. أو استخدم زر 'سحب من ملف قاعدة بيانات المديرية (USB)' لسحبها مباشرة من الفلاش ديسك دون الحاجة لشبكة."
+            f"تعذر إتمام سحب بيانات الإقامة:\n{err_msg}\n\n"
+            f"💡 إرشاد فوري:\n"
+            f"يمكنك النقر على الزر الأخضر: '⚡ استرجاع فوري لبيانات الإقامة (أوفلاين بدون إنترنت)' لاسترجاعها فوراً من الفلاش ديسك دون الحاجة لإنترنت."
         )
