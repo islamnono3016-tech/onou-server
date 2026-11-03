@@ -115,6 +115,31 @@ class DatabaseManager:
     def _init_manager(self, db_path: Optional[str] = None):
         self.db_path = db_path or DEFAULT_DB_PATH
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+
+        need_official_seed = False
+        if not os.path.exists(self.db_path) or os.path.getsize(self.db_path) == 0:
+            need_official_seed = True
+        else:
+            try:
+                _test_c = sqlite3.connect(self.db_path)
+                _cur = _test_c.execute("SELECT COUNT(*) FROM stock_movements")
+                _cnt = _cur.fetchone()[0]
+                _test_c.close()
+                if _cnt == 0:
+                    need_official_seed = True
+            except Exception:
+                pass
+
+        if need_official_seed:
+            official_backup = os.path.join(BASE_DIR, "database", "official_catering_stock.db")
+            if os.path.exists(official_backup) and os.path.getsize(official_backup) > 100000:
+                import shutil
+                try:
+                    shutil.copy2(official_backup, self.db_path)
+                    logger.info(f"Initialized database from official snapshot: {official_backup}")
+                except Exception as ex_init:
+                    logger.warning(f"Could not copy official snapshot: {ex_init}")
+
         # اتصال دائم يبقي ذاكرة WAL المشتركة نشطة ويمنع تفريغ وإعادة بناء الملفات عند كل إغلاق على وسائط التخزين
         self._keep_alive = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self._keep_alive.execute("PRAGMA journal_mode = WAL;")
@@ -149,10 +174,14 @@ class DatabaseManager:
                     schema_sql = f.read()
                 conn.executescript(schema_sql)
 
-            # التحقق من رقم إصدار البنية لتخطي الفحوصات المتكررة عند كل تشغيل (0 ميلي ثانية)
+            # ???? ??? ?????? ?????? ??????? ???????? ????? (RES-04) ?????? ??? ?????? (0 ???? ????? ??? ???? ??????)
+            self._migrate_residence_4_data(conn)
+            self._fix_future_scrambled_records(conn)
+
+            # ?????? ?? ??? ????? ?????? ????? ???????? ???????? ??? ?? ????? (0 ???? ?????)
             ver_cur = conn.execute("SELECT value FROM settings WHERE key='schema_version'")
             ver_row = ver_cur.fetchone()
-            if ver_row and ver_row["value"] == "2026.11.03":
+            if ver_row and ver_row["value"] == "2026.11.03.2":
                 return
 
             # 2. ترقية الأعمدة الناقصة لجميع الجداول بأمان (Safe Schema Migration)
@@ -294,7 +323,7 @@ class DatabaseManager:
                     UNIQUE(bon_id, product_num, col_index)
                 )
             """)
-            conn.execute("INSERT OR REPLACE INTO settings (key, value, description) VALUES ('schema_version', '2026.11.03', 'إصدار بنية قاعدة البيانات');")
+            conn.execute("INSERT OR REPLACE INTO settings (key, value, description) VALUES ('schema_version', '2026.11.03.2', 'إصدار بنية قاعدة البيانات');")
             conn.commit()
         finally:
             conn.close()
@@ -589,10 +618,75 @@ class DatabaseManager:
     def _migrate_residence_4_data(conn: sqlite3.Connection):
         """ترحيل وبذر كافة بيانات الإقامة الجامعية حساني محمد بن إبراهيم (RES-04) لشهر سبتمبر وأكتوبر 2026"""
         try:
-            from database.seed_residence_4_data import seed_residence_4
-            seed_residence_4(conn)
+            cur = conn.execute("SELECT value FROM settings WHERE key='residence_4_seeded_v3.5.1'")
+            row = cur.fetchone()
+            if row and row["value"] == "1":
+                return
+
+            seed_func = None
+            seed_py = os.path.join(BASE_DIR, "database", "seed_residence_4_data.py")
+            if os.path.exists(seed_py):
+                try:
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location("seed_res_4_disk", seed_py)
+                    if spec and spec.loader:
+                        mod = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(mod)
+                        if hasattr(mod, "seed_residence_4"):
+                            seed_func = mod.seed_residence_4
+                            logger.info("Loaded seed_residence_4 dynamically from disk.")
+                except Exception as ex_d:
+                    logger.warning(f"Failed loading seed from disk: {ex_d}")
+
+            if not seed_func:
+                from database.seed_residence_4_data import seed_residence_4
+                seed_func = seed_residence_4
+
+            stats = seed_func(conn, force=True)
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('residence_4_seeded_v3.5.1', '1')")
+            conn.commit()
+            logger.info(f"Residence 4 seeded successfully: {stats}")
         except Exception as e:
             logger.error(f"Error in _migrate_residence_4_data: {e}")
+
+
+    @staticmethod
+    def _fix_future_scrambled_records(conn: sqlite3.Connection):
+        """تصحيح السجلات المستقبلية الناتجة عن أخطاء ساعة وتاريخ بعض الحواسيب"""
+        try:
+            cur = conn.execute("SELECT value FROM settings WHERE key='future_records_fixed_v3.5.2'")
+            row = cur.fetchone()
+            if row and row["value"] == "1":
+                return
+
+            # تصحيح سجلات الإقامة 2 التي سجلت بتاريخ 2026-11-26 بدلاً من 2026-11-02
+            conn.execute("""
+                UPDATE entry_vouchers 
+                SET date = '2026-11-02', 
+                    voucher_number = REPLACE(voucher_number, '2026-11-26', '2026-11-02')
+                WHERE residence_id = 2 AND date = '2026-11-26'
+            """)
+            conn.execute("""
+                UPDATE exit_vouchers 
+                SET date = '2026-11-02', 
+                    voucher_number = REPLACE(voucher_number, '2026-11-26', '2026-11-02')
+                WHERE residence_id = 2 AND date = '2026-11-26'
+            """)
+            conn.execute("""
+                UPDATE stock_movements 
+                SET date = '2026-11-02'
+                WHERE residence_id = 2 AND date = '2026-11-26'
+            """)
+            conn.execute("""
+                UPDATE daily_meals_tracking 
+                SET date = '2026-11-02'
+                WHERE residence_id = 2 AND date = '2026-11-26'
+            """)
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('future_records_fixed_v3.5.2', '1')")
+            conn.commit()
+            logger.info("Fixed future scrambled records for v3.5.2 successfully.")
+        except Exception as e:
+            logger.error(f"Error in _fix_future_scrambled_records: {e}")
 
     def get_setting(self, key: str, default: str = "") -> str:
 

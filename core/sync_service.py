@@ -1,3 +1,7 @@
+try:
+    from core.time_service import TimeService
+except Exception:
+    TimeService = None
 import uuid
 import json
 import logging
@@ -79,7 +83,7 @@ class SyncService:
         """تحديث حالة الحركات الناجحة إلى منتهية"""
         if not sync_ids:
             return
-        now_str = datetime.datetime.now().isoformat()
+        now_str = TimeService.iso_now() if TimeService else datetime.datetime.now().isoformat()
         placeholders = ",".join("?" for _ in sync_ids)
         with self.db.get_connection() as conn:
             conn.execute(f"""
@@ -317,6 +321,264 @@ class SyncService:
         except Exception as e:
             logger.warning(f"Notice pull catalog: {e}")
             return 0
+
+    def apply_residence_full_data(self, residence_id: int, data: Dict[str, Any]) -> Dict[str, int]:
+        """
+        تطبيق وحفظ الحزمة الكاملة لبيانات إقامة محددة حصراً داخل قاعدة البيانات المحلية.
+        يضمن العزل التام: لا يمس أي إقامة أخرى إطلاقاً!
+        """
+        with self.db.get_connection() as conn:
+            conn.execute("PRAGMA foreign_keys = OFF;")
+            try:
+                # 1. تنظيف بيانات هذه الإقامة حصراً
+                conn.execute("DELETE FROM entry_voucher_items WHERE voucher_id IN (SELECT id FROM entry_vouchers WHERE residence_id = ?)", (residence_id,))
+                conn.execute("DELETE FROM entry_vouchers WHERE residence_id = ?", (residence_id,))
+                conn.execute("DELETE FROM exit_voucher_items WHERE voucher_id IN (SELECT id FROM exit_vouchers WHERE residence_id = ?)", (residence_id,))
+                conn.execute("DELETE FROM exit_vouchers WHERE residence_id = ?", (residence_id,))
+                conn.execute("DELETE FROM stock_movements WHERE residence_id = ?", (residence_id,))
+                conn.execute("DELETE FROM daily_meals_tracking WHERE residence_id = ?", (residence_id,))
+                conn.execute("DELETE FROM residence_articles WHERE residence_id = ?", (residence_id,))
+                conn.execute("DELETE FROM residence_loan_items WHERE loan_id IN (SELECT id FROM residence_loans WHERE from_residence_id = ? OR to_residence_id = ?)", (residence_id, residence_id))
+                conn.execute("DELETE FROM residence_loans WHERE from_residence_id = ? OR to_residence_id = ?", (residence_id, residence_id))
+                conn.execute("DELETE FROM inventory_snapshots WHERE residence_id = ?", (residence_id,))
+                conn.execute("DELETE FROM unlocked_days WHERE residence_id = ?", (residence_id,))
+                conn.execute("DELETE FROM supplier_allocations WHERE residence_id = ?", (residence_id,))
+                conn.execute("DELETE FROM bon_commande_qty WHERE bon_id IN (SELECT id FROM bon_commande WHERE residence_id = ?)", (residence_id,))
+                conn.execute("DELETE FROM bon_commande WHERE residence_id = ?", (residence_id,))
+    
+                counts = {}
+    
+                # 2. إدراج القوائم المرجعية العامة إن وجدت (فئات، ممونين، مواد)
+                for tbl in ["categories", "suppliers", "articles"]:
+                    rows = data.get(tbl, [])
+                    if rows:
+                        cols = list(rows[0].keys())
+                        placeholders = ",".join("?" for _ in cols)
+                        sql = f"INSERT OR REPLACE INTO {tbl} ({','.join(cols)}) VALUES ({placeholders})"
+                        val_list = [tuple(r.get(c) for c in cols) for r in rows]
+                        conn.executemany(sql, val_list)
+                        counts[tbl] = len(rows)
+    
+                # 3. إدراج بيانات الإقامة المعنية
+                tbl_order = [
+                    "daily_meals_tracking",
+                    "entry_vouchers",
+                    "entry_voucher_items",
+                    "exit_vouchers",
+                    "exit_voucher_items",
+                    "stock_movements",
+                    "residence_articles",
+                    "residence_loans",
+                    "residence_loan_items",
+                    "inventory_snapshots",
+                    "unlocked_days",
+                    "supplier_allocations",
+                    "bon_commande",
+                    "bon_commande_qty"
+                ]
+    
+                for tbl in tbl_order:
+                    rows = data.get(tbl, [])
+                    if rows:
+                        cols = list(rows[0].keys())
+                        placeholders = ",".join("?" for _ in cols)
+                        sql = f"INSERT OR REPLACE INTO {tbl} ({','.join(cols)}) VALUES ({placeholders})"
+                        val_list = [tuple(r.get(c) for c in cols) for r in rows]
+                        conn.executemany(sql, val_list)
+                        counts[tbl] = len(rows)
+                    else:
+                        counts[tbl] = 0
+    
+                # 4. تفريغ رتل المزامنة المعلق للإقامة لمنع إعادة رفع حركات قديمة
+                conn.execute("DELETE FROM sync_queue WHERE residence_id = ?", (residence_id,))
+                conn.commit()
+            finally:
+                try:
+                    conn.execute("PRAGMA foreign_keys = ON;")
+                except Exception:
+                    pass
+
+        try:
+            from core.cache_service import CacheService
+            CacheService.invalidate_all()
+        except Exception:
+            pass
+
+        return counts
+
+    def pull_full_residence_data(self, residence_id: int, base_url: Optional[str] = None) -> Dict[str, Any]:
+        """
+        طلب وسحب الحزمة الكاملة لبيانات إقامة محددة من سيرفر المديرية عبر الشبكة،
+        ثم تطبيقها في قاعدة البيانات المحلية.
+        """
+        url = base_url or AppConfig.get_server_url()
+        timeout = AppConfig.get("timeout_seconds", 35.0)
+        try:
+            endpoint = f"{url}/api/sync/residence_full_pull?residence_id={residence_id}"
+            logger.info(f"Connecting to Directorate server for residence full pull: {endpoint}")
+            r = http_get(endpoint, timeout=timeout)
+            if r.status_code != 200:
+                err_msg = f"فشل الاتصال بسيرفر المديرية (رمز الاستجابة: {r.status_code})"
+                try:
+                    err_json = r.json()
+                    if "error" in err_json:
+                        err_msg += f": {err_json['error']}"
+                except Exception:
+                    pass
+                return {"success": False, "error": err_msg}
+
+            resp_json = r.json()
+            if not resp_json.get("success"):
+                return {"success": False, "error": resp_json.get("error", "فشل غير معروف من سيرفر المديرية")}
+
+            data = resp_json.get("data", {})
+            counts = self.apply_residence_full_data(residence_id, data)
+            return {
+                "success": True,
+                "residence_id": residence_id,
+                "residence_name": resp_json.get("residence_name", f"الإقامة {residence_id}"),
+                "counts": counts
+            }
+        except Exception as e:
+            logger.exception("Error in pull_full_residence_data")
+            return {"success": False, "error": f"تعذر سحب البيانات عبر الشبكة: {str(e)}"}
+
+    def restore_residence_from_db_file(self, residence_id: int, db_path: str) -> Dict[str, Any]:
+        """
+        سحب واسترجاع بيانات إقامة محددة مباشرة من ملف قاعدة بيانات المديرية (مثال: من فلاش ديسك USB).
+        """
+        import sqlite3
+        import os
+        if not os.path.exists(db_path):
+            return {"success": False, "error": f"الملف المحدد غير موجود: {db_path}"}
+
+        try:
+            src = sqlite3.connect(db_path)
+            src.row_factory = sqlite3.Row
+
+            res_row = src.execute("SELECT id, name FROM residences WHERE id = ?", (residence_id,)).fetchone()
+            res_name = res_row["name"] if res_row else f"الإقامة {residence_id}"
+
+            data = {}
+            for tbl in ["categories", "suppliers", "articles"]:
+                try:
+                    cur = src.execute(f"SELECT * FROM {tbl}")
+                    cols = [c[0] for c in cur.description] if cur.description else []
+                    data[tbl] = [dict(zip(cols, r)) for r in cur.fetchall()]
+                except Exception:
+                    data[tbl] = []
+
+            # daily_meals_tracking
+            cur = src.execute("SELECT * FROM daily_meals_tracking WHERE residence_id = ?", (residence_id,))
+            cols = [c[0] for c in cur.description] if cur.description else []
+            data["daily_meals_tracking"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            # entry_vouchers & items
+            cur = src.execute("SELECT * FROM entry_vouchers WHERE residence_id = ?", (residence_id,))
+            cols = [c[0] for c in cur.description] if cur.description else []
+            entry_vouchers = [dict(zip(cols, r)) for r in cur.fetchall()]
+            data["entry_vouchers"] = entry_vouchers
+
+            ev_ids = [v["id"] for v in entry_vouchers]
+            if ev_ids:
+                placeholders = ",".join("?" for _ in ev_ids)
+                cur = src.execute(f"SELECT * FROM entry_voucher_items WHERE voucher_id IN ({placeholders})", tuple(ev_ids))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                data["entry_voucher_items"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+            else:
+                data["entry_voucher_items"] = []
+
+            # exit_vouchers & items
+            cur = src.execute("SELECT * FROM exit_vouchers WHERE residence_id = ?", (residence_id,))
+            cols = [c[0] for c in cur.description] if cur.description else []
+            exit_vouchers = [dict(zip(cols, r)) for r in cur.fetchall()]
+            data["exit_vouchers"] = exit_vouchers
+
+            ex_ids = [v["id"] for v in exit_vouchers]
+            if ex_ids:
+                placeholders = ",".join("?" for _ in ex_ids)
+                cur = src.execute(f"SELECT * FROM exit_voucher_items WHERE voucher_id IN ({placeholders})", tuple(ex_ids))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                data["exit_voucher_items"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+            else:
+                data["exit_voucher_items"] = []
+
+            # stock_movements
+            cur = src.execute("SELECT * FROM stock_movements WHERE residence_id = ?", (residence_id,))
+            cols = [c[0] for c in cur.description] if cur.description else []
+            data["stock_movements"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            # residence_articles
+            cur = src.execute("SELECT * FROM residence_articles WHERE residence_id = ?", (residence_id,))
+            cols = [c[0] for c in cur.description] if cur.description else []
+            data["residence_articles"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            # residence_loans & items
+            cur = src.execute("SELECT * FROM residence_loans WHERE from_residence_id = ? OR to_residence_id = ?", (residence_id, residence_id))
+            cols = [c[0] for c in cur.description] if cur.description else []
+            loans = [dict(zip(cols, r)) for r in cur.fetchall()]
+            data["residence_loans"] = loans
+
+            loan_ids = [l["id"] for l in loans]
+            if loan_ids:
+                placeholders = ",".join("?" for _ in loan_ids)
+                cur = src.execute(f"SELECT * FROM residence_loan_items WHERE loan_id IN ({placeholders})", tuple(loan_ids))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                data["residence_loan_items"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+            else:
+                data["residence_loan_items"] = []
+
+            # inventory_snapshots
+            cur = src.execute("SELECT * FROM inventory_snapshots WHERE residence_id = ?", (residence_id,))
+            cols = [c[0] for c in cur.description] if cur.description else []
+            data["inventory_snapshots"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            # unlocked_days
+            try:
+                cur = src.execute("SELECT * FROM unlocked_days WHERE residence_id = ?", (residence_id,))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                data["unlocked_days"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+            except Exception:
+                data["unlocked_days"] = []
+
+            # supplier_allocations
+            try:
+                cur = src.execute("SELECT * FROM supplier_allocations WHERE residence_id = ?", (residence_id,))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                data["supplier_allocations"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+            except Exception:
+                data["supplier_allocations"] = []
+
+            # bon_commande & items
+            try:
+                cur = src.execute("SELECT * FROM bon_commande WHERE residence_id = ?", (residence_id,))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                bcs = [dict(zip(cols, r)) for r in cur.fetchall()]
+                data["bon_commande"] = bcs
+                bc_ids = [b["id"] for b in bcs]
+                if bc_ids:
+                    placeholders = ",".join("?" for _ in bc_ids)
+                    cur = src.execute(f"SELECT * FROM bon_commande_qty WHERE bon_id IN ({placeholders})", tuple(bc_ids))
+                    cols = [c[0] for c in cur.description] if cur.description else []
+                    data["bon_commande_qty"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+                else:
+                    data["bon_commande_qty"] = []
+            except Exception:
+                data["bon_commande"] = []
+                data["bon_commande_qty"] = []
+
+            src.close()
+
+            counts = self.apply_residence_full_data(residence_id, data)
+            return {
+                "success": True,
+                "residence_id": residence_id,
+                "residence_name": res_name,
+                "counts": counts
+            }
+        except Exception as e:
+            logger.exception("Error in restore_residence_from_db_file")
+            return {"success": False, "error": f"فشل استخراج البيانات من ملف قاعدة البيانات: {str(e)}"}
 
 class SyncWorker(QThread):
     """

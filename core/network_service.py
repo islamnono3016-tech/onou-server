@@ -532,6 +532,162 @@ class NetworkServer:
                     except Exception as e:
                         self._send_json(500, {"error": f"Full export failed: {e}"})
 
+                elif path == "/api/sync/residence_full_pull":
+                    # سحب وتصدير كافة بيانات إقامة معينة للمزامنة والاسترجاع الشامل
+                    res_id_raw = query_params.get("residence_id")
+                    if not res_id_raw:
+                        self._send_json(400, {"success": False, "error": "يرجى تحديد معرف الإقامة (residence_id)"})
+                    else:
+                        try:
+                            r_id = int(res_id_raw)
+                        except ValueError:
+                            self._send_json(400, {"success": False, "error": "معرف الإقامة غير صالح"})
+                            r_id = None
+
+                        if r_id is not None:
+                            try:
+                                with db.get_connection() as conn:
+                                    res_row = conn.execute("SELECT id, name, code FROM residences WHERE id = ?", (r_id,)).fetchone()
+                                    res_name = res_row["name"] if res_row else f"الإقامة {r_id}"
+
+                                    # 1. أوراق الوجبات
+                                    cur = conn.execute("SELECT * FROM daily_meals_tracking WHERE residence_id = ? ORDER BY date ASC", (r_id,))
+                                    cols = [c[0] for c in cur.description] if cur.description else []
+                                    meals = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                                    # 2. وصولات الدخول
+                                    cur = conn.execute("SELECT * FROM entry_vouchers WHERE residence_id = ? ORDER BY date ASC", (r_id,))
+                                    cols = [c[0] for c in cur.description] if cur.description else []
+                                    entry_vouchers = [dict(zip(cols, r)) for r in cur.fetchall()]
+                                    
+                                    entry_v_ids = [v["id"] for v in entry_vouchers]
+                                    entry_items = []
+                                    if entry_v_ids:
+                                        placeholders = ",".join("?" for _ in entry_v_ids)
+                                        cur_it = conn.execute(f"SELECT * FROM entry_voucher_items WHERE voucher_id IN ({placeholders})", tuple(entry_v_ids))
+                                        it_cols = [c[0] for c in cur_it.description] if cur_it.description else []
+                                        entry_items = [dict(zip(it_cols, r)) for r in cur_it.fetchall()]
+
+                                    # 3. وصولات الخروج
+                                    cur = conn.execute("SELECT * FROM exit_vouchers WHERE residence_id = ? ORDER BY date ASC", (r_id,))
+                                    cols = [c[0] for c in cur.description] if cur.description else []
+                                    exit_vouchers = [dict(zip(cols, r)) for r in cur.fetchall()]
+                                    
+                                    exit_v_ids = [v["id"] for v in exit_vouchers]
+                                    exit_items = []
+                                    if exit_v_ids:
+                                        placeholders = ",".join("?" for _ in exit_v_ids)
+                                        cur_it = conn.execute(f"SELECT * FROM exit_voucher_items WHERE voucher_id IN ({placeholders})", tuple(exit_v_ids))
+                                        it_cols = [c[0] for c in cur_it.description] if cur_it.description else []
+                                        exit_items = [dict(zip(it_cols, r)) for r in cur_it.fetchall()]
+
+                                    # 4. حركات المخزون
+                                    cur = conn.execute("SELECT * FROM stock_movements WHERE residence_id = ? ORDER BY date ASC, id ASC", (r_id,))
+                                    cols = [c[0] for c in cur.description] if cur.description else []
+                                    movements = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                                    # 5. أرصدة ومخصصات المواد
+                                    cur = conn.execute("SELECT * FROM residence_articles WHERE residence_id = ?", (r_id,))
+                                    cols = [c[0] for c in cur.description] if cur.description else []
+                                    res_articles = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                                    # 6. الإعارات والاستعارات
+                                    cur = conn.execute("SELECT * FROM residence_loans WHERE from_residence_id = ? OR to_residence_id = ?", (r_id, r_id))
+                                    cols = [c[0] for c in cur.description] if cur.description else []
+                                    loans = [dict(zip(cols, r)) for r in cur.fetchall()]
+                                    loan_ids = [l["id"] for l in loans]
+                                    loan_items = []
+                                    if loan_ids:
+                                        placeholders = ",".join("?" for _ in loan_ids)
+                                        cur_it = conn.execute(f"SELECT * FROM residence_loan_items WHERE loan_id IN ({placeholders})", tuple(loan_ids))
+                                        it_cols = [c[0] for c in cur_it.description] if cur_it.description else []
+                                        loan_items = [dict(zip(it_cols, r)) for r in cur_it.fetchall()]
+
+                                    # 7. محاضر الجرد الشهري
+                                    cur = conn.execute("SELECT * FROM inventory_snapshots WHERE residence_id = ?", (r_id,))
+                                    cols = [c[0] for c in cur.description] if cur.description else []
+                                    inventories = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                                    # 8. أيام مفتوحة
+                                    cur = conn.execute("SELECT * FROM unlocked_days WHERE residence_id = ?", (r_id,))
+                                    cols = [c[0] for c in cur.description] if cur.description else []
+                                    unlocked = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                                    # 9. حصص الممونين
+                                    cur = conn.execute("SELECT * FROM supplier_allocations WHERE residence_id = ?", (r_id,))
+                                    cols = [c[0] for c in cur.description] if cur.description else []
+                                    allocations = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                                    # 10. سندات الطلب
+                                    cur = conn.execute("SELECT * FROM bon_commande WHERE residence_id = ?", (r_id,))
+                                    cols = [c[0] for c in cur.description] if cur.description else []
+                                    bon_commandes = [dict(zip(cols, r)) for r in cur.fetchall()]
+                                    bc_ids = [b["id"] for b in bon_commandes]
+                                    bon_quantities = []
+                                    if bc_ids:
+                                        placeholders = ",".join("?" for _ in bc_ids)
+                                        cur_it = conn.execute(f"SELECT * FROM bon_commande_qty WHERE bon_id IN ({placeholders})", tuple(bc_ids))
+                                        it_cols = [c[0] for c in cur_it.description] if cur_it.description else []
+                                        bon_quantities = [dict(zip(it_cols, r)) for r in cur_it.fetchall()]
+
+                                    # 11. الدليل المرجعي العام (المواد، الممونين، الأصناف)
+                                    cur = conn.execute("SELECT * FROM articles")
+                                    cols = [c[0] for c in cur.description] if cur.description else []
+                                    articles_catalog = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                                    cur = conn.execute("SELECT * FROM suppliers")
+                                    cols = [c[0] for c in cur.description] if cur.description else []
+                                    suppliers_catalog = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                                    cur = conn.execute("SELECT * FROM categories")
+                                    cols = [c[0] for c in cur.description] if cur.description else []
+                                    categories_catalog = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                                    self._send_json(200, {
+                                        "success": True,
+                                        "residence_id": r_id,
+                                        "residence_name": res_name,
+                                        "counts": {
+                                            "meals": len(meals),
+                                            "entry_vouchers": len(entry_vouchers),
+                                            "entry_voucher_items": len(entry_items),
+                                            "exit_vouchers": len(exit_vouchers),
+                                            "exit_voucher_items": len(exit_items),
+                                            "stock_movements": len(movements),
+                                            "residence_articles": len(res_articles),
+                                            "residence_loans": len(loans),
+                                            "inventory_snapshots": len(inventories),
+                                            "unlocked_days": len(unlocked),
+                                            "supplier_allocations": len(allocations),
+                                            "bon_commande": len(bon_commandes),
+                                            "bon_commande_qty": len(bon_quantities),
+                                            "articles": len(articles_catalog),
+                                            "suppliers": len(suppliers_catalog),
+                                            "categories": len(categories_catalog)
+                                        },
+                                        "data": {
+                                            "daily_meals_tracking": meals,
+                                            "entry_vouchers": entry_vouchers,
+                                            "entry_voucher_items": entry_items,
+                                            "exit_vouchers": exit_vouchers,
+                                            "exit_voucher_items": exit_items,
+                                            "stock_movements": movements,
+                                            "residence_articles": res_articles,
+                                            "residence_loans": loans,
+                                            "residence_loan_items": loan_items,
+                                            "inventory_snapshots": inventories,
+                                            "unlocked_days": unlocked,
+                                            "supplier_allocations": allocations,
+                                            "bon_commande": bon_commandes,
+                                            "bon_commande_qty": bon_quantities,
+                                            "articles": articles_catalog,
+                                            "suppliers": suppliers_catalog,
+                                            "categories": categories_catalog
+                                        }
+                                    })
+                            except Exception as ex_pull:
+                                self._send_json(500, {"success": False, "error": f"Failed to export residence data: {ex_pull}"})
+
                 else:
                     self._send_json(404, {"error": "Endpoint Not Found"})
 

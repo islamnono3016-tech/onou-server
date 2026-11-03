@@ -1,4 +1,4 @@
-﻿from PyQt6.QtGui import QPixmap, QIcon
+from PyQt6.QtGui import QPixmap, QIcon
 from typing import Optional, Dict, Any
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -397,7 +397,13 @@ class MainWindow(QMainWindow):
         self.trimester_page = TrimesterSituationWidget(self.stock_svc, self.report_gen)
         self.reports_page = ReportsWidget(self.report_gen, is_directorate=is_admin, current_user=self.current_user)
         self.bon_commande_page = BonCommandeWidget(self.db, self.current_user)
-        self.settings_page = SettingsWidget(self.db)
+        self.settings_page = SettingsWidget(
+            self.db,
+            current_user=self.current_user,
+            residence_id=self.current_residence_id
+        )
+        if hasattr(self.settings_page, "residence_data_pulled"):
+            self.settings_page.residence_data_pulled.connect(self.on_residence_data_pulled)
 
         self.stack.addWidget(self.dashboard_page)       # 0 + offset
         self.stack.addWidget(self.daily_sheet_page)     # 1 + offset
@@ -646,6 +652,8 @@ class MainWindow(QMainWindow):
             self.daily_sheet_page.meals_svc.set_residence(r_id)
             self.daily_sheet_page.report_gen.set_residence(r_id, r_name)
             self.daily_sheet_page.load_daily_sheet()
+        if hasattr(self, "settings_page") and hasattr(self.settings_page, "set_residence"):
+            self.settings_page.set_residence(r_id, r_name)
 
         # مزامنة الكومبوبوكس إن وجد
         if hasattr(self, "cmb_residence_switch"):
@@ -850,9 +858,21 @@ class MainWindow(QMainWindow):
             self.sync_worker.trigger_immediate_sync()
 
     def update_clock(self):
-        curr_d = QDate.currentDate().toString("yyyy-MM-dd")
-        curr_t = QTime.currentTime().toString("HH:mm")
-        self.lbl_clock.setText(f"📅 {curr_d}  {curr_t}")
+        try:
+            from core.time_service import TimeService
+            curr_d = TimeService.current_qdate().toString("yyyy-MM-dd")
+            curr_t = TimeService.current_qtime().toString("HH:mm")
+            status = TimeService.get_status_info()
+            if status.get("synced"):
+                self.lbl_clock.setText(f"🌐 {curr_d}  {curr_t}")
+                self.lbl_clock.setToolTip(f"توقيت عالمي رسمي موحد (UTC+1)\nالمصدر: {status.get('source')}\nالإزاحة: {status.get('offset_seconds')} ثانية")
+            else:
+                self.lbl_clock.setText(f"📅 {curr_d}  {curr_t}")
+                self.lbl_clock.setToolTip("توقيت محلي (جاري المزامنة...)")
+        except Exception:
+            curr_d = QDate.currentDate().toString("yyyy-MM-dd")
+            curr_t = QTime.currentTime().toString("HH:mm")
+            self.lbl_clock.setText(f"📅 {curr_d}  {curr_t}")
 
     # -------------------------------------------------------------
     # إدارة المزامنة والربط الشبكي والاستقلالية التامة
@@ -990,6 +1010,18 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"🟢 تم استقبال وتحديث بيانات الإقامات تلقائياً على الشاشة ({pulled_count} حركة جديدة)", 5000)
         except Exception as e:
             logger.error(f"Error in on_new_residence_data: {e}")
+
+    def on_residence_data_pulled(self, r_id: int):
+        """يُستدعى عند نجاح سحب واسترجاع بيانات الإقامة لتحديث الواجهة فورياً"""
+        try:
+            from core.cache_service import CacheService
+            CacheService.invalidate_all()
+        except Exception:
+            pass
+        self.dirty_pages = set(range(self.stack.count()))
+        if hasattr(self, "current_residence_id") and self.current_residence_id == r_id:
+            self.set_active_residence(self.current_residence_id, self.current_residence_name)
+        self.refresh_current_page_data()
 
     def update_sync_ui(self, is_online: bool):
         is_admin = self.is_directorate_session()
