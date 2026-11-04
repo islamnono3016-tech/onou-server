@@ -190,7 +190,7 @@ class NetworkServer:
 
         _IP_REQUEST_LOG: Dict[str, List[float]] = {}
         MAX_REQ_PER_MIN = 600
-        MAX_PAYLOAD_SIZE = 5 * 1024 * 1024  # 5 MB max request size
+        MAX_PAYLOAD_SIZE = 15 * 1024 * 1024  # 15 MB max request size
 
         class RequestHandler(BaseHTTPRequestHandler):
             server_version = "ONOU-SecureServer/3.0"
@@ -479,7 +479,6 @@ class NetworkServer:
                             """)
                             cur = conn.execute(query, tuple(params))
                             events = []
-                            max_id = since_id
                             for r in cur.fetchall():
                                 row_dict = dict(r)
                                 try:
@@ -487,17 +486,52 @@ class NetworkServer:
                                 except Exception:
                                     pass
                                 events.append(row_dict)
-                                if row_dict["id"] > max_id:
-                                    max_id = row_dict["id"]
+
+                            cur_max_row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM sync_events").fetchone()
+                            server_max_id = int(cur_max_row[0] or 0) if cur_max_row else 0
 
                             self._send_json(200, {
                                 "success": True,
                                 "events": events,
                                 "count": len(events),
-                                "latest_id": max_id
+                                "latest_id": server_max_id,
+                                "server_max_id": server_max_id,
+                                "reset_required": (since_id > server_max_id)
                             })
                         except Exception as e:
                             self._send_json(500, {"error": f"Pull failed: {e}"})
+
+                elif path == "/api/sync/summary":
+                    # ملخص شامل لإحصائيات كافة الإقامات للتحقق من التطابق والجاهزية
+                    try:
+                        with db.get_connection() as conn:
+                            cur_max = conn.execute("SELECT COALESCE(MAX(id), 0) FROM sync_events").fetchone()[0]
+                            cur_max = int(cur_max or 0)
+                            res_summary = {}
+                            res_rows = conn.execute("SELECT id, name FROM residences ORDER BY id ASC").fetchall()
+                            for r in res_rows:
+                                rid = r["id"]
+                                m_cnt = conn.execute("SELECT COUNT(*) FROM daily_meals_tracking WHERE residence_id = ?", (rid,)).fetchone()[0]
+                                en_cnt = conn.execute("SELECT COUNT(*) FROM entry_vouchers WHERE residence_id = ?", (rid,)).fetchone()[0]
+                                ex_cnt = conn.execute("SELECT COUNT(*) FROM exit_vouchers WHERE residence_id = ?", (rid,)).fetchone()[0]
+                                mv_cnt = conn.execute("SELECT COUNT(*) FROM stock_movements WHERE residence_id = ?", (rid,)).fetchone()[0]
+                                last_m = conn.execute("SELECT MAX(date) FROM daily_meals_tracking WHERE residence_id = ?", (rid,)).fetchone()[0]
+                                res_summary[str(rid)] = {
+                                    "id": rid,
+                                    "name": r["name"],
+                                    "meals": m_cnt,
+                                    "entry_vouchers": en_cnt,
+                                    "exit_vouchers": ex_cnt,
+                                    "stock_movements": mv_cnt,
+                                    "last_meal_date": last_m
+                                }
+                            self._send_json(200, {
+                                "success": True,
+                                "server_max_sync_event_id": cur_max,
+                                "residences": res_summary
+                            })
+                    except Exception as e_sum:
+                        self._send_json(500, {"success": False, "error": f"Summary failed: {e_sum}"})
 
                 elif path == "/api/sync/full_export":
                     # تصدير شامل لكافة البيانات لمزامنة الحواسيب الجديدة فورياً
@@ -695,7 +729,7 @@ class NetworkServer:
                 try:
                     path = self.path.split("?")[0]
                     # استثناء مزامنة بيانات الإقامات وتسجيل الدخول من التقييد
-                    if path not in ("/api/sync/push", "/api/auth/login"):
+                    if path not in ("/api/sync/push", "/api/auth/login", "/api/sync/residence_full_push"):
                         if not self._check_rate_limit():
                             self._send_json(429, {"error": "Rate limit exceeded. Please slow down."})
                             return
@@ -839,6 +873,39 @@ class NetworkServer:
                             "synced_ids": synced_ids
                         })
 
+
+                    elif path == "/api/sync/residence_full_push":
+                        # استقبال الحزمة الكاملة لبيانات إقامة محددة وتحديثها بالكامل في السيرفر
+                        try:
+                            r_id = payload.get("residence_id")
+                            if not r_id:
+                                self._send_json(400, {"success": False, "error": "يرجى تحديد residence_id"})
+                            else:
+                                r_id = int(r_id)
+                                data = payload.get("data", {})
+                                from core.sync_service import SyncService
+                                sync_engine = SyncService(db)
+                                counts = sync_engine.apply_residence_full_data(r_id, data)
+
+                                # تسجيل حدث المزامنة الشاملة
+                                try:
+                                    s_id = f"full_push_{r_id}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+                                    with db.get_connection() as conn:
+                                        conn.execute("""
+                                            INSERT OR IGNORE INTO sync_events (sync_id, residence_id, entity_type, action, entity_id, payload)
+                                            VALUES (?, ?, 'residence_full_push', 'UPSERT', ?, ?)
+                                        """, (s_id, r_id, str(r_id), json.dumps({"residence_id": r_id, "counts": counts}, ensure_ascii=False)))
+                                        conn.commit()
+                                except Exception as ev_err:
+                                    logger.warning(f"Notice sync_event logging for full push: {ev_err}")
+
+                                self._send_json(200, {
+                                    "success": True,
+                                    "residence_id": r_id,
+                                    "applied_counts": counts
+                                })
+                        except Exception as exp_push:
+                            self._send_json(500, {"success": False, "error": f"Failed to push full residence data: {exp_push}"})
 
                     elif path == "/api/sync/full_import":
                         # استيراد شامل وحفظ في سجل المزامنة المركزي
