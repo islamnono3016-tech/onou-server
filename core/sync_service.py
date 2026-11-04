@@ -177,22 +177,21 @@ class SyncService:
         """
         from core.config import AppConfig
 
-        # حظر قطعي لا رجعة فيه: سحب البيانات حصري للمديرية المركزية فقط
-        # أي حاسوب إقامة (سواء نمط CLIENT أو محدد به رقم إقامة) يُمنع منعاً باتاً من سحب وتعديل بياناته
+        # سحب وتحديث البيانات متاح لكافة حواسيب ومكاتب المديرية المركزية
         cfg_mode = AppConfig.get("app_mode", "")
         cfg_res_id = AppConfig.get("residence_id")
 
-        if AppConfig.is_client_mode() or cfg_mode == "RESIDENCE_CLIENT":
-            logger.info("🚫 سحب البيانات محظور: هذا الجهاز حاسوب إقامة ولا يسحب أي بيانات من الخارج.")
-            return 0
+        is_true_directorate = is_directorate or getattr(self, "is_directorate", False) or (cfg_mode == "DIRECTORATE_SERVER")
 
-        if cfg_res_id and int(cfg_res_id) > 0 and cfg_mode != "DIRECTORATE_SERVER":
-            logger.info(f"🚫 سحب البيانات محظور: هذا الجهاز مرتبط بالإقامة {cfg_res_id} ولا يسحب أي بيانات.")
-            return 0
-
-        # المديرية فقط في وضع الخادم ومع تصريح المديرية هي من يملك صلاحية السحب
-        is_true_directorate = (cfg_mode == "DIRECTORATE_SERVER") or is_directorate or getattr(self, "is_directorate", False)
         if not is_true_directorate:
+            if AppConfig.is_client_mode() or cfg_mode == "RESIDENCE_CLIENT":
+                logger.info("🚫 سحب البيانات محظور: هذا الجهاز حاسوب إقامة ولا يسحب أي بيانات من الخارج.")
+                return 0
+
+            if cfg_res_id and int(cfg_res_id) > 0:
+                logger.info(f"🚫 سحب البيانات محظور: هذا الجهاز مرتبط بالإقامة {cfg_res_id} ولا يسحب أي بيانات.")
+                return 0
+
             logger.info("🚫 سحب البيانات محظور: السحب متاح لمركز قيادة المديرية المركزية فقط.")
             return 0
         url = base_url or AppConfig.get_server_url()
@@ -580,6 +579,112 @@ class SyncService:
             logger.exception("Error in restore_residence_from_db_file")
             return {"success": False, "error": f"فشل استخراج البيانات من ملف قاعدة البيانات: {str(e)}"}
 
+    def sync_all_residences_from_server(self, base_url: Optional[str] = None, progress_cb: Optional[Any] = None) -> Dict[str, Any]:
+        """
+        تحديث ومزامنة شاملة لكافة الإقامات التسع من الخادم المركزي للمديرية.
+        مخصص لمكاتب وحواسيب المديرية لضمان تطابق كامل ودقيق للبيانات عبر كل أجهزة المديرية.
+        """
+        url = base_url or AppConfig.get_server_url()
+        with self.db.get_connection() as conn:
+            res_rows = conn.execute("SELECT id, name, code FROM residences ORDER BY id ASC").fetchall()
+
+        if not res_rows:
+            return {"success": False, "error": "لا توجد إقامات مسجلة في قاعدة البيانات"}
+
+        total = len(res_rows)
+        synced_count = 0
+        details = {}
+
+        logger.info(f"Starting complete sync for all {total} residences from Directorate server: {url}")
+        for idx, r in enumerate(res_rows):
+            r_id = r["id"]
+            r_name = r["name"]
+            if progress_cb:
+                try:
+                    progress_cb(idx + 1, total, r_name)
+                except Exception:
+                    pass
+
+            res = self.pull_full_residence_data(r_id, base_url=url)
+            if res.get("success"):
+                synced_count += 1
+                details[r_id] = {"name": r_name, "success": True, "counts": res.get("counts", {})}
+            else:
+                details[r_id] = {"name": r_name, "success": False, "error": res.get("error")}
+
+        # مزامنة مؤشر الأحداث إلى أحدث حدث موجود على السيرفر
+        try:
+            r_st = http_get(f"{url}/api/sync/pull?since_id=0&limit=1", timeout=12.0)
+            if r_st.status_code == 200:
+                latest_id = r_st.json().get("latest_id", 0)
+                if latest_id:
+                    self.db.set_setting("last_pulled_sync_event_id", str(latest_id))
+        except Exception as e_ev:
+            logger.warning(f"Notice setting last_pulled_sync_event_id after full sync: {e_ev}")
+
+        try:
+            from core.cache_service import CacheService
+            CacheService.invalidate_all()
+        except Exception:
+            pass
+
+        return {
+            "success": synced_count > 0,
+            "synced_count": synced_count,
+            "total_residences": total,
+            "details": details
+        }
+
+    def sync_all_residences_from_db_file(self, db_path: str, progress_cb: Optional[Any] = None) -> Dict[str, Any]:
+        """
+        تحديث ومزامنة شاملة لكافة الإقامات التسع محلياً بدون إنترنت من ملف قاعدة بيانات (مثال: فلاش ديسك USB).
+        """
+        import os
+        import sqlite3
+        if not os.path.exists(db_path):
+            return {"success": False, "error": f"الملف غير موجود: {db_path}"}
+
+        try:
+            src = sqlite3.connect(db_path)
+            res_rows = src.execute("SELECT id, name FROM residences ORDER BY id ASC").fetchall()
+            src.close()
+        except Exception as e:
+            return {"success": False, "error": f"تعذر قراءة قاعدة البيانات المحددة: {e}"}
+
+        if not res_rows:
+            return {"success": False, "error": "لم يتم العثور على أي إقامات في الملف المحدد"}
+
+        total = len(res_rows)
+        synced_count = 0
+        details = {}
+
+        for idx, (r_id, r_name) in enumerate(res_rows):
+            if progress_cb:
+                try:
+                    progress_cb(idx + 1, total, r_name)
+                except Exception:
+                    pass
+
+            res = self.restore_residence_from_db_file(r_id, db_path)
+            if res.get("success"):
+                synced_count += 1
+                details[r_id] = {"name": r_name, "success": True, "counts": res.get("counts", {})}
+            else:
+                details[r_id] = {"name": r_name, "success": False, "error": res.get("error")}
+
+        try:
+            from core.cache_service import CacheService
+            CacheService.invalidate_all()
+        except Exception:
+            pass
+
+        return {
+            "success": synced_count > 0,
+            "synced_count": synced_count,
+            "total_residences": total,
+            "details": details
+        }
+
 class SyncWorker(QThread):
     """
     خيط مزامنة خلفي غير متزامن في الخلفية لضمان عدم تجميد واجهة المستخدم.
@@ -603,8 +708,14 @@ class SyncWorker(QThread):
         self.is_running = True
         self.last_online_state: Optional[bool] = None
         self._trigger_now = False
+        self._force_full_sync = False
         self._last_pulled_id = 0  # آخر معرف تم سحبه (لكشف التحديثات الجديدة)
         self._consecutive_failures = 0
+
+    def trigger_full_all_sync(self):
+        """طلب تحديث شامل وفوري لكافة الإقامات في الخلفية"""
+        self._force_full_sync = True
+        self._trigger_now = True
 
     def trigger_immediate_sync(self):
         self._trigger_now = True
@@ -638,15 +749,27 @@ class SyncWorker(QThread):
                     pushed = 0
                     pulled = 0
 
-                    is_dir_server = (self.is_directorate or AppConfig.get("app_mode") == "DIRECTORATE_SERVER") and not self.residence_id
+                    is_dir_server = self.is_directorate or (AppConfig.get("app_mode") == "DIRECTORATE_SERVER" and not self.residence_id)
 
                     if is_dir_server:
                         # ═══════════════════════════════════════════════════════
-                        # وضع المديرية المركزية: سحب أحدث بيانات الإقامات
+                        # وضع المديرية المركزية: سحب وتحديث بيانات كافة الإقامات
                         # ═══════════════════════════════════════════════════════
-                        pulled = self.sync_svc.pull_updates(residence_id=None, is_directorate=True)
-                        if pulled > 0:
-                            self.new_residence_data_received.emit(pulled)
+                        # 1. إذا كان مؤشر المزامنة 0 أو طُلب تحديث شامل لكافة الإقامات
+                        last_id = int(self.sync_svc.db.get_setting("last_pulled_sync_event_id", "0") or "0")
+                        if last_id == 0 or getattr(self, "_force_full_sync", False):
+                            self._force_full_sync = False
+                            logger.info("SyncWorker: Initializing complete data sync for all 9 residences on Directorate station...")
+                            full_sync_res = self.sync_svc.sync_all_residences_from_server()
+                            if full_sync_res.get("success"):
+                                pulled += full_sync_res.get("synced_count", 0)
+                                self.new_residence_data_received.emit(pulled)
+
+                        # 2. سحب الحركات التزايدية المستمرة من الإقامات
+                        pulled_inc = self.sync_svc.pull_updates(residence_id=None, is_directorate=True)
+                        if pulled_inc > 0:
+                            pulled += pulled_inc
+                            self.new_residence_data_received.emit(pulled_inc)
 
                         # وفي حال تم تسجيل أي حركة في المديرية، تُرسل أيضاً
                         pending_cnt = self.sync_svc.get_pending_count(None)
@@ -682,3 +805,38 @@ class SyncWorker(QThread):
                 if self._trigger_now:
                     break
                 self.msleep(1000)
+
+
+class AllResidencesSyncThread(QThread):
+    """
+    خيط مزامنة خلفي غير متزامن لتحديث كافة الإقامات دفعة واحدة دون تجميد واجهة المستخدم
+    """
+    progress = pyqtSignal(int, int, str)  # (current, total, residence_name)
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, sync_service: SyncService, mode: str = "SERVER", db_path: Optional[str] = None, parent=None):
+        super().__init__(parent)
+        self.sync_svc = sync_service
+        self.mode = mode
+        self.db_path = db_path
+        self._is_canceled = False
+
+    def cancel(self):
+        self._is_canceled = True
+
+    def run(self):
+        try:
+            def cb(curr, tot, name):
+                if not self._is_canceled:
+                    self.progress.emit(curr, tot, name)
+
+            if self.mode == "SERVER":
+                res = self.sync_svc.sync_all_residences_from_server(progress_cb=cb)
+            else:
+                res = self.sync_svc.sync_all_residences_from_db_file(self.db_path or "", progress_cb=cb)
+
+            self.finished.emit(res)
+        except Exception as e:
+            logger.exception("Error in AllResidencesSyncThread")
+            self.error.emit(str(e))

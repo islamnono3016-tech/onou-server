@@ -3,7 +3,7 @@ from typing import Optional, Dict, Any
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QStackedWidget, QButtonGroup,
-    QStatusBar, QFrame, QComboBox, QMessageBox
+    QStatusBar, QFrame, QComboBox, QMessageBox, QProgressDialog
 )
 from PyQt6.QtCore import Qt, QTimer, QDate, QTime
 from database.db_manager import DatabaseManager
@@ -15,7 +15,7 @@ from core.auth_service import AuthService
 from core.backup_service import BackupService
 from core.network_service import get_local_ip
 from core.config import AppConfig
-from core.sync_service import SyncWorker, SyncService
+from core.sync_service import SyncWorker, SyncService, AllResidencesSyncThread
 from reports.report_generator import ReportGenerator
 
 from ui.widgets.dashboard_widget import DashboardWidget
@@ -253,15 +253,15 @@ class MainWindow(QMainWindow):
         self.lbl_switch = None
         if is_admin:
             self.lbl_res.setVisible(False)
-            titles_widget.setMinimumWidth(440)
-            titles_widget.setMaximumWidth(550)
+            titles_widget.setMinimumWidth(380)
+            titles_widget.setMaximumWidth(460)
             self.cmb_residence_switch = QComboBox()
             self.cmb_residence_switch.setObjectName("ResidenceSwitchCombo")
-            self.cmb_residence_switch.setMinimumWidth(440)
-            self.cmb_residence_switch.setMaximumWidth(550)
+            self.cmb_residence_switch.setMinimumWidth(380)
+            self.cmb_residence_switch.setMaximumWidth(460)
             self.cmb_residence_switch.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
             if self.cmb_residence_switch.view():
-                self.cmb_residence_switch.view().setMinimumWidth(460)
+                self.cmb_residence_switch.view().setMinimumWidth(400)
                 self.cmb_residence_switch.view().setTextElideMode(Qt.TextElideMode.ElideNone)
             self.populate_residence_switcher()
             self.cmb_residence_switch.currentIndexChanged.connect(self.on_residence_combo_changed)
@@ -271,6 +271,28 @@ class MainWindow(QMainWindow):
 
         titles_box.addWidget(self.lbl_dir)
         hb_layout.addWidget(titles_widget)
+
+        if is_admin:
+            self.btn_sync_all_residences = QPushButton("🔄 تحديث كافة الإقامات")
+            self.btn_sync_all_residences.setObjectName("BtnSyncAllResidences")
+            self.btn_sync_all_residences.setToolTip("تحديث ومزامنة بيانات كافة الإقامات التسع فورياً من الخادم المركزي أو الفلاش ديسك")
+            self.btn_sync_all_residences.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_sync_all_residences.setStyleSheet("""
+                QPushButton#BtnSyncAllResidences {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #10B981);
+                    color: #FFFFFF;
+                    font-size: 11px;
+                    font-weight: bold;
+                    border-radius: 6px;
+                    padding: 6px 12px;
+                    border: 1px solid #34D399;
+                }
+                QPushButton#BtnSyncAllResidences:hover {
+                    background: #047857;
+                }
+            """)
+            self.btn_sync_all_residences.clicked.connect(self.on_sync_all_residences_clicked)
+            hb_layout.addWidget(self.btn_sync_all_residences)
 
         hb_layout.addStretch()
 
@@ -873,11 +895,12 @@ class MainWindow(QMainWindow):
     def is_directorate_session(self) -> bool:
         """
         فحص ما إذا كانت الجلسة الحالية تمثل المديرية المركزية:
-        - فقط وحصرياً عند تسجيل الدخول بحساب مسؤول النظام المركزي (SUPER_ADMIN وبدون إقامة محددة).
+        - أي حساب إدارة مركزية أو مدير عام أو مراقب تسيير (SUPER_ADMIN, ADMIN, DIRECTORATE, DIRECTOR...) وبدون إقامة محددة.
+        - أو إذا كان نمط التطبيق خادم مديرية DIRECTORATE_SERVER.
         - حسابات الإقامات (STOREKEEPER / RESIDENCE_USER أو أي حساب بـ residence_id محدد) هي جلسة إقامة دائماً.
         """
         if not hasattr(self, "current_user") or not self.current_user:
-            return False
+            return AppConfig.get("app_mode") == "DIRECTORATE_SERVER"
 
         res_id = self.current_user.get("residence_id")
         if res_id is not None and str(res_id).strip() not in ("", "0", "None"):
@@ -887,15 +910,115 @@ class MainWindow(QMainWindow):
         if role in ("STOREKEEPER", "RESIDENCE_USER"):
             return False
 
-        return role == "SUPER_ADMIN"
+        if role in ("SUPER_ADMIN", "ADMIN", "DIRECTORATE", "DIRECTOR", "CHEF_SERVICE", "CONTROLLER", "GESTIONNAIRE", "INSPECTOR") or "ADMIN" in role or "DIRECT" in role:
+            return True
+
+        return AppConfig.get("app_mode") == "DIRECTORATE_SERVER"
+
+
+    def on_sync_all_residences_clicked(self):
+        """مزامنة وتحديث كافة الإقامات التسع للمديرية دفعة واحدة"""
+        is_online = self.sync_worker.sync_svc.is_server_reachable() if self.sync_worker else False
+
+        if not is_online:
+            usb_candidates = [r"H:\official_catering_stock.db", r"H:\data\official_catering_stock.db"]
+            found_usb = None
+            for p in usb_candidates:
+                if os.path.exists(p):
+                    found_usb = p
+                    break
+
+            if found_usb:
+                ans = QMessageBox.question(
+                    self,
+                    "تحديث شامل (أوفلاين بدون إنترنت)",
+                    f"تعذر الاتصال بالخادم المركزي السحابي في الوقت الحالي.\nتم العثور على قاعدة بيانات الإقامات في الفلاش ديسك:\n{found_usb}\n\nهل ترغب في تحديث ومزامنة بيانات كافة الإقامات التسع من الفلاش ديسك؟",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if ans == QMessageBox.StandardButton.Yes:
+                    self._start_all_residences_sync(mode="FILE", db_path=found_usb)
+                return
+            else:
+                QMessageBox.warning(
+                    self,
+                    "تعذر الاتصال",
+                    "تعذر الاتصال بالخادم المركزي السحابي، ولم يتم العثور على فلاش ديسك H:\\ به قاعدة البيانات.\nيرجى التحقق من اتصال الإنترنت أو إدخال الفلاش ديسك."
+                )
+                return
+
+        self._start_all_residences_sync(mode="SERVER")
+
+    def _start_all_residences_sync(self, mode="SERVER", db_path=None):
+        if hasattr(self, "_all_sync_thread") and self._all_sync_thread.isRunning():
+            return
+
+        if hasattr(self, "btn_sync_all_residences"):
+            self.btn_sync_all_residences.setEnabled(False)
+            self.btn_sync_all_residences.setText("⏳ جارٍ التحديث...")
+
+        prog = QProgressDialog("جارٍ الاتصال ومزامنة بيانات كافة الإقامات...", "إلغاء", 0, 9, self)
+        prog.setWindowTitle("مزامنة وتحديث كافة الإقامات")
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+        prog.show()
+
+        sync_svc = self.sync_worker.sync_svc if self.sync_worker else SyncService(self.db)
+        thread = AllResidencesSyncThread(sync_svc, mode=mode, db_path=db_path, parent=self)
+        self._all_sync_thread = thread
+
+        def on_prog(curr, tot, name):
+            prog.setMaximum(tot)
+            prog.setValue(curr)
+            prog.setLabelText(f"جارٍ تحديث ({curr}/{tot}): {name}...")
+
+        def on_done(res):
+            prog.close()
+            if hasattr(self, "btn_sync_all_residences"):
+                self.btn_sync_all_residences.setEnabled(True)
+                self.btn_sync_all_residences.setText("🔄 تحديث كافة الإقامات")
+
+            if res.get("success"):
+                synced_cnt = res.get("synced_count", 0)
+                tot_cnt = res.get("total_residences", 9)
+                msg = f"✅ تم بنجاح تحديث ومزامنة بيانات ({synced_cnt} من أصل {tot_cnt}) إقامات جامعية.\nكافة الجداول، البطاقات، والتقارير محدثة بالكامل الآن."
+                QMessageBox.information(self, "اكتمل التحديث الشامل", msg)
+                self.mark_pages_dirty()
+                self.refresh_current_page_data()
+                if hasattr(self, "res_manager_page"):
+                    try:
+                        self.res_manager_page.load_data()
+                    except Exception:
+                        pass
+            else:
+                QMessageBox.warning(self, "تنبيه", f"تعذر إكمال التحديث الشامل:\n{res.get('error', 'خطأ غير معروف')}")
+
+        def on_err(err_str):
+            prog.close()
+            if hasattr(self, "btn_sync_all_residences"):
+                self.btn_sync_all_residences.setEnabled(True)
+                self.btn_sync_all_residences.setText("🔄 تحديث كافة الإقامات")
+            QMessageBox.critical(self, "خطأ في المزامنة", f"حدث خطأ أثناء المزامنة:\n{err_str}")
+
+        prog.canceled.connect(thread.cancel)
+        thread.progress.connect(on_prog)
+        thread.finished.connect(on_done)
+        thread.error.connect(on_err)
+        thread.start()
 
     def init_sync_worker(self):
         """
         تهيئة خيط المزامنة بنمط محكم وأحادي الاتجاه:
-        - المديرية المركزية: سيرفر المديرية مع حساب SUPER_ADMIN (سحب بيانات الإقامات)
+        - المديرية المركزية: سيرفر المديرية مع حساب SUPER_ADMIN (سحب وتحديث بيانات الإقامات)
         - الإقامات: إرسال (push) فقط إلى الخادم المركزي — لا تسحب شيئاً لمنع الكتابة فوق مدخلاتها
         """
         is_directorate = self.is_directorate_session()
+
+        if is_directorate:
+            try:
+                AppConfig.set("app_mode", "DIRECTORATE_SERVER")
+            except Exception:
+                pass
 
         worker_res_id = None if is_directorate else self.current_residence_id
 

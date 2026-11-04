@@ -3,8 +3,9 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
     QPushButton, QLineEdit, QComboBox, QMessageBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QProgressBar,
-    QFormLayout, QScrollArea, QCheckBox, QTimeEdit
+    QFormLayout, QScrollArea, QCheckBox, QTimeEdit, QProgressDialog
 )
+from core.sync_service import SyncService, AllResidencesSyncThread
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTime, QUrl
 from PyQt6.QtGui import QCursor, QDesktopServices
 import os
@@ -302,6 +303,58 @@ class SettingsWidget(QWidget):
         pp_card_l.addWidget(self.lbl_pull_status)
 
         pp_layout.addWidget(pp_card)
+
+        # بطاقة المديرية: تحديث ومزامنة بيانات كافة الإقامات التسع
+        dir_card = QFrame()
+        dir_card.setStyleSheet(
+            "background-color: #064E3B; "
+            "border: 1.5px solid #10B981; "
+            "border-radius: 8px; padding: 14px; margin-top: 10px;"
+        )
+        dir_card_l = QVBoxLayout(dir_card)
+        dir_card_l.setSpacing(10)
+
+        lbl_dir_title = QLabel("🏢 خاص بحواسيب ومكاتب المديرية: تحديث ومزامنة بيانات كافة الإقامات التسع (9)")
+        lbl_dir_title.setStyleSheet("color: #FFFFFF; font-weight: bold; font-size: 13px;")
+        dir_card_l.addWidget(lbl_dir_title)
+
+        lbl_dir_desc = QLabel(
+            "تتيح هذه الخاصية لجميع حواسيب ومكاتب المديرية (المدير، رئيس مصلحة الإطعام، مراقبي التسيير والمخازن) "
+            "تحديث وسحب أحدث بيانات كافة الإقامات التسع دفعة واحدة من السيرفر السحابي أو من الفلاش ديسك لضمان تطابق وتكامل الأرقام والإحصائيات."
+        )
+        lbl_dir_desc.setStyleSheet("color: #E2E8F0; font-size: 11px; line-height: 1.4;")
+        lbl_dir_desc.setWordWrap(True)
+        dir_card_l.addWidget(lbl_dir_desc)
+
+        dir_btn_box = QHBoxLayout()
+        dir_btn_box.setSpacing(10)
+
+        self.btn_sync_all_cloud = QPushButton("🌐 تحديث وسحب بيانات جميع الإقامات (سحابي من الخادم)")
+        self.btn_sync_all_cloud.setStyleSheet(
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #10B981); "
+            "color: #FFFFFF; font-weight: bold; padding: 10px 16px; border-radius: 6px; font-size: 12px;"
+        )
+        self.btn_sync_all_cloud.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_sync_all_cloud.clicked.connect(self.on_sync_all_cloud_clicked)
+        dir_btn_box.addWidget(self.btn_sync_all_cloud)
+
+        self.btn_sync_all_usb = QPushButton("📁 تحديث وسحب بيانات جميع الإقامات من فلاش ديسك (محلي بدون إنترنت)")
+        self.btn_sync_all_usb.setStyleSheet(
+            "background-color: #1E293B; border: 1.5px solid #10B981; color: #FFFFFF; "
+            "font-weight: bold; padding: 10px 14px; border-radius: 6px; font-size: 11px;"
+        )
+        self.btn_sync_all_usb.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_sync_all_usb.clicked.connect(self.on_sync_all_usb_clicked)
+        dir_btn_box.addWidget(self.btn_sync_all_usb)
+
+        dir_card_l.addLayout(dir_btn_box)
+
+        self.lbl_dir_sync_status = QLabel("")
+        self.lbl_dir_sync_status.setStyleSheet("font-size: 12px; color: #6EE7B7;")
+        self.lbl_dir_sync_status.setWordWrap(True)
+        dir_card_l.addWidget(self.lbl_dir_sync_status)
+
+        pp_layout.addWidget(dir_card)
         layout.addWidget(pull_panel)
 
         settings_panel = QFrame()
@@ -1236,3 +1289,101 @@ class SettingsWidget(QWidget):
             f"💡 إرشاد فوري:\n"
             f"يمكنك النقر على الزر الأخضر: '⚡ استرجاع فوري لبيانات الإقامة (أوفلاين بدون إنترنت)' لاسترجاعها فوراً من الفلاش ديسك دون الحاجة لإنترنت."
         )
+
+    def on_sync_all_cloud_clicked(self):
+        """سحب وتحديث بيانات كافة الإقامات التسع سحابياً من سيرفر المديرية"""
+        ans = QMessageBox.question(
+            self,
+            "تأكيد تحديث كافة الإقامات",
+            "هل ترغب في تحديث ومزامنة بيانات كافة الإقامات التسع (9) من الخادم السحابي؟\n\n"
+            "سيتم جلب أحدث السجلات والوصولات وبطاقات اليومية لجميع الإقامات وتحديث قاعدة البيانات المحلية فوراً.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+
+        self._run_all_residences_sync(mode="SERVER")
+
+    def on_sync_all_usb_clicked(self):
+        """سحب وتحديث بيانات كافة الإقامات التسع محلياً من ملف قاعدة بيانات (فلاش ديسك USB)"""
+        # البحث التلقائي عن ملف قاعدة البيانات في USB أو المسارات المعروفة
+        cand_files = get_candidate_official_dbs()
+        selected_file = None
+        if cand_files:
+            selected_file = cand_files[0]
+        else:
+            selected_file, _ = QFileDialog.getOpenFileName(
+                self,
+                "تحديد ملف قاعدة بيانات المديرية (USB)",
+                "H:\\",
+                "قواعد بيانات SQLite (*.db);;كافة الملفات (*.*)"
+            )
+
+        if not selected_file or not os.path.exists(selected_file):
+            QMessageBox.warning(self, "ملف غير موجود", "لم يتم العثور على ملف قاعدة البيانات أو تم إلغاء الاختيار.")
+            return
+
+        ans = QMessageBox.question(
+            self,
+            "تأكيد التحديث من الفلاش ديسك",
+            f"تم تحديد الملف:\n{selected_file}\n\nهل ترغب في استرجاع وتحديث بيانات كافة الإقامات التسع من هذا الملف؟",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+
+        self._run_all_residences_sync(mode="FILE", db_path=selected_file)
+
+    def _run_all_residences_sync(self, mode="SERVER", db_path=None):
+        if hasattr(self, "_dir_sync_thread") and self._dir_sync_thread.isRunning():
+            return
+
+        self.btn_sync_all_cloud.setEnabled(False)
+        self.btn_sync_all_usb.setEnabled(False)
+        self.lbl_dir_sync_status.setText("⏳ جارٍ تهيئة التحديث الشامل لكافة الإقامات...")
+
+        prog = QProgressDialog("جارٍ تحديث بيانات كافة الإقامات...", "إلغاء", 0, 9, self)
+        prog.setWindowTitle("تحديث ومزامنة كافة الإقامات")
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+        prog.show()
+
+        sync_svc = SyncService(self.db)
+        thread = AllResidencesSyncThread(sync_svc, mode=mode, db_path=db_path, parent=self)
+        self._dir_sync_thread = thread
+
+        def on_prog(curr, tot, name):
+            prog.setMaximum(tot)
+            prog.setValue(curr)
+            prog.setLabelText(f"جارٍ تحديث ({curr}/{tot}): {name}...")
+            self.lbl_dir_sync_status.setText(f"⏳ جارٍ التحديث ({curr}/{tot}): {name}...")
+
+        def on_done(res):
+            prog.close()
+            self.btn_sync_all_cloud.setEnabled(True)
+            self.btn_sync_all_usb.setEnabled(True)
+            if res.get("success"):
+                synced_cnt = res.get("synced_count", 0)
+                tot_cnt = res.get("total_residences", 9)
+                msg = f"✅ تم بنجاح تحديث ومزامنة بيانات ({synced_cnt} من أصل {tot_cnt}) إقامات جامعية بالكامل."
+                self.lbl_dir_sync_status.setText(msg)
+                QMessageBox.information(self, "نجاح التحديث الشامل", msg)
+                self.residence_data_pulled.emit(0)
+            else:
+                err_msg = res.get("error", "فشل التحديث الشامل")
+                self.lbl_dir_sync_status.setText(f"❌ {err_msg}")
+                QMessageBox.warning(self, "تنبيه", f"تعذر إكمال التحديث الشامل:\n{err_msg}")
+
+        def on_err(err_str):
+            prog.close()
+            self.btn_sync_all_cloud.setEnabled(True)
+            self.btn_sync_all_usb.setEnabled(True)
+            self.lbl_dir_sync_status.setText(f"❌ خطأ: {err_str}")
+            QMessageBox.critical(self, "خطأ", f"حدث خطأ أثناء التحديث:\n{err_str}")
+
+        prog.canceled.connect(thread.cancel)
+        thread.progress.connect(on_prog)
+        thread.finished.connect(on_done)
+        thread.error.connect(on_err)
+        thread.start()
