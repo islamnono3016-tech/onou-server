@@ -1053,7 +1053,10 @@ class MainWindow(QMainWindow):
             self.status.showMessage("🔄 جارٍ إرسال البيانات المحفوظة إلى الخادم المركزي...", 5000)
 
         if self.sync_worker:
-            self.sync_worker.trigger_immediate_sync()
+            if is_directorate:
+                self.sync_worker.trigger_full_all_sync()
+            else:
+                self.sync_worker.trigger_immediate_sync()
         else:
             self.init_sync_worker()
 
