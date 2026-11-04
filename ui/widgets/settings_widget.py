@@ -108,6 +108,27 @@ class PullResidenceWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
+class PushResidenceWorker(QThread):
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, residence_id: int, db_manager: DatabaseManager, parent=None):
+        super().__init__(parent)
+        self.residence_id = residence_id
+        self.db = db_manager
+
+    def run(self):
+        try:
+            from core.sync_service import SyncService
+            sync_svc = SyncService(self.db)
+            res = sync_svc.push_full_residence_data(self.residence_id)
+            if res.get("success"):
+                self.finished.emit(res)
+            else:
+                self.error.emit(res.get("error", "فشلت عملية رفع البيانات"))
+        except Exception as e:
+            self.error.emit(str(e))
+
 
 class SettingsWidget(QWidget):
     """شاشة الإعدادات، النسخ الاحتياطي التلقائي واليدوي، وترحيل البيانات"""
@@ -295,6 +316,21 @@ class SettingsWidget(QWidget):
         btn_box.addWidget(self.btn_pull_res_file)
 
         pp_card_l.addLayout(btn_box)
+
+        # صف زر رفع وتثبيت البيانات للمديرية (لحفظ بيانات الحاسوب الحالي وتمكين استرجاعها على أي جهاز جديد)
+        push_btn_box = QHBoxLayout()
+        push_btn_box.setSpacing(10)
+
+        self.btn_push_residence = QPushButton("🚀 إرسال ورفع كافة بيانات الإقامة دفعة واحدة إلى خادم المديرية (حفظ دائم)")
+        self.btn_push_residence.setStyleSheet(
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #7C3AED, stop:1 #9333EA); "
+            "color: #FFFFFF; font-weight: bold; padding: 10px 16px; border-radius: 6px; font-size: 12px;"
+        )
+        self.btn_push_residence.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_push_residence.clicked.connect(self.on_push_residence_clicked)
+        push_btn_box.addWidget(self.btn_push_residence)
+
+        pp_card_l.addLayout(push_btn_box)
 
         # تسمية الحالة والتقدم
         self.lbl_pull_status = QLabel("")
@@ -1289,6 +1325,62 @@ class SettingsWidget(QWidget):
             f"💡 إرشاد فوري:\n"
             f"يمكنك النقر على الزر الأخضر: '⚡ استرجاع فوري لبيانات الإقامة (أوفلاين بدون إنترنت)' لاسترجاعها فوراً من الفلاش ديسك دون الحاجة لإنترنت."
         )
+
+    def on_push_residence_clicked(self):
+        r_id = self.get_selected_pull_residence_id()
+        r_name = self.get_selected_pull_residence_name(r_id)
+
+        reply = QMessageBox.question(
+            self,
+            "تأكيد رفع كافة بيانات الإقامة للمديرية",
+            f"هل تريد إرسال ورفع كافة بيانات إقامتك الحالية إلى خادم المديرية المركزي؟\n\n"
+            f"🏢 الإقامة المعنية: {r_name} (رقم: {r_id})\n\n"
+            f"🚀 الفائدة والهدف:\n"
+            f"• سيتم رفع وتثبيت كافة أوراق الاستهلاك، الوصولات، بطاقات الوجبات، والمخزون المسجل على هذا الحاسوب.\n"
+            f"• سيمكنك لاحقاً استرجاع كامل هذه البيانات تلقائياً على أي حاسوب جديد أو معاد تسطيبه.\n\n"
+            f"هل تود المتابعة ورفع البيانات الآن؟",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.btn_push_residence.setEnabled(False)
+        self.lbl_pull_status.setText(f"⏳ جاري رفع وتثبيت بيانات {r_name} إلى خادم المديرية المركزي...")
+        self.lbl_pull_status.setStyleSheet("color: #A855F7; font-weight: bold; font-size: 12px;")
+
+        self.push_worker = PushResidenceWorker(r_id, self.db, parent=self)
+        self.push_worker.finished.connect(self._on_push_finished)
+        self.push_worker.error.connect(self._on_push_error)
+        self.push_worker.start()
+
+    def _on_push_finished(self, res: dict):
+        if hasattr(self, 'btn_push_residence'):
+            self.btn_push_residence.setEnabled(True)
+        r_id = res.get("residence_id", 0)
+        r_name = res.get("residence_name", "الإقامة")
+        counts = res.get("counts", {})
+
+        msg = (
+            f"✅ تم رفع وتثبيت كافة بيانات إقامتك في خادم المديرية المركزي بنجاح!\n\n"
+            f"🏢 الإقامة: {r_name} (رقم: {r_id})\n\n"
+            f"📊 تفاصيل البيانات المرفوعة والمثبتة بالسيرفر:\n"
+            f"  • بطاقات تعداد الوجبات: {counts.get('daily_meals_tracking', 0)} يوم\n"
+            f"  • وصولات الاستلام (دخول): {counts.get('entry_vouchers', 0)} وصل\n"
+            f"  • وصولات الاستهلاك (خروج): {counts.get('exit_vouchers', 0)} وصل\n"
+            f"  • حركات المخزون: {counts.get('stock_movements', 0)} حركة\n\n"
+            f"💡 هذه البيانات أصبحت الآن متاحة ومحفوظة بالمديرية ويمكنك استرجاعها فوراً عند تسطيب البرنامج على أي جهاز جديد."
+        )
+        self.lbl_pull_status.setText(f"✅ تم رفع وتثبيت بيانات {r_name} في خادم المديرية بنجاح!")
+        self.lbl_pull_status.setStyleSheet("color: #10B981; font-weight: bold; font-size: 12px;")
+        QMessageBox.information(self, "نجاح رفع وتثبيت البيانات", msg)
+
+    def _on_push_error(self, err_msg: str):
+        if hasattr(self, 'btn_push_residence'):
+            self.btn_push_residence.setEnabled(True)
+        self.lbl_pull_status.setText(f"❌ تعذر الرفع: {err_msg}")
+        self.lbl_pull_status.setStyleSheet("color: #EF4444; font-weight: bold; font-size: 12px;")
+        QMessageBox.warning(self, "تعذر رفع البيانات", f"تعذر رفع بيانات الإقامة إلى خادم المديرية:\n{err_msg}\n\nيرجى التحقق من اتصال الإنترنت والمحاولة مرة أخرى.")
 
     def on_sync_all_cloud_clicked(self):
         """سحب وتحديث بيانات كافة الإقامات التسع سحابياً من سيرفر المديرية"""
