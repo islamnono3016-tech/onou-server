@@ -196,6 +196,21 @@ class SyncService:
             return 0
         url = base_url or AppConfig.get_server_url()
         last_id = int(self.db.get_setting("last_pulled_sync_event_id", "0") or "0")
+
+        # فحص استكشافي ذكي (Active Probe) لكشف ما إذا كان مؤشر الجهاز يسبق الخادم المركزي أو إذا تمت إعادة تشغيل الخادم
+        if last_id > 0:
+            try:
+                r_probe = http_get(f"{url}/api/sync/pull?since_id=0&limit=1", timeout=8.0)
+                if r_probe.status_code == 200:
+                    probe_data = r_probe.json()
+                    server_true_max = int(probe_data.get("latest_id", 0) or 0)
+                    if last_id > server_true_max:
+                        logger.info(f"Local sync pointer ({last_id}) is ahead of server true max ({server_true_max}). Auto-resetting pointer to 0.")
+                        self.db.set_setting("last_pulled_sync_event_id", "0")
+                        last_id = 0
+            except Exception as e_pr:
+                logger.debug(f"Probe notice: {e_pr}")
+
         endpoint = f"{url}/api/sync/pull?since_id={last_id}&limit=200"
         if residence_id:
             endpoint += f"&residence_id={residence_id}"
