@@ -407,18 +407,31 @@ class NetworkServer:
                             search_locations.append(d_path)
 
                     target_file = None
-                    p_files = []
+                    # أولوية قطعية لحزمة التحديث الشامل v3.5.9 و update_latest
+                    preferred_names = ["update_latest.dou_patch", "update_v3.5.9.dou_patch", "تحديث_v3.5.9_شامل.dou_patch"]
                     for loc in search_locations:
                         if os.path.exists(loc):
-                            try:
-                                for f in os.listdir(loc):
-                                    if f.endswith(".dou_patch") or f.endswith(".patch") or (f.startswith("update_") and f.endswith(".zip")):
-                                        p_files.append(os.path.join(loc, f))
-                            except Exception:
-                                pass
+                            for pref in preferred_names:
+                                cand = os.path.join(loc, pref)
+                                if os.path.exists(cand) and os.path.getsize(cand) > 1000:
+                                    target_file = cand
+                                    break
+                        if target_file:
+                            break
 
-                    if p_files:
-                        target_file = max(p_files, key=os.path.getmtime)
+                    if not target_file:
+                        p_files = []
+                        for loc in search_locations:
+                            if os.path.exists(loc):
+                                try:
+                                    for f in os.listdir(loc):
+                                        if f.endswith(".dou_patch") or f.endswith(".patch") or (f.startswith("update_") and f.endswith(".zip")):
+                                            p_files.append(os.path.join(loc, f))
+                                except Exception:
+                                    pass
+
+                        if p_files:
+                            target_file = max(p_files, key=os.path.getmtime)
 
                     if not target_file or not os.path.exists(target_file):
                         # توجيه تلقائي للتنزيل المباشر من GitHub
