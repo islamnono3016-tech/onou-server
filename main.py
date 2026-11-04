@@ -29,6 +29,57 @@ class _DiskOverrideFinder(importlib.abc.MetaPathFinder):
 if getattr(sys, "frozen", False):
     sys.meta_path.insert(0, _DiskOverrideFinder())
 
+# فحص وضع تشغيل السيرفر السحابي المستقل (Headless Cloud Server - Render / Linux / Cloud VPS)
+is_server_mode = bool(os.environ.get("PORT") or os.environ.get("RENDER") or "--server" in sys.argv)
+if not is_server_mode and sys.platform != "win32":
+    try:
+        import PyQt6
+    except ImportError:
+        is_server_mode = True
+
+if is_server_mode:
+    import time
+    import signal
+    from database.db_manager import DatabaseManager
+    from core.network_service import NetworkServer, get_local_ip
+
+    port = int(os.environ.get("PORT", 8050))
+    candidates = [
+        os.path.join(BASE_DIR, "database", "official_catering_stock.db"),
+        os.path.join(BASE_DIR, "data", "catering_stock.db"),
+        os.path.join(BASE_DIR, "catering_stock.db"),
+    ]
+    db_path = None
+    for cand in candidates:
+        if os.path.exists(cand):
+            db_path = cand
+            break
+    if not db_path:
+        db_path = candidates[0]
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    server = NetworkServer(port=port, db_manager=db_manager)
+    server.start()
+    local_ip = get_local_ip()
+    print(f"=== ONOU Central Cloud Server started successfully on {local_ip}:{port} ===")
+    print(f"=== Database: {db_path} ===")
+
+    def shutdown(sig, frame):
+        print("Shutting down server...")
+        server.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    try:
+        signal.signal(signal.SIGTERM, shutdown)
+    except Exception:
+        pass
+
+    while True:
+        time.sleep(1)
+
+
 
 
 
