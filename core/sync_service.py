@@ -206,7 +206,9 @@ class SyncService:
                 return 0
             data = r.json()
             latest_on_server = int(data.get("latest_id", 0) or 0)
-            if last_id > latest_on_server:
+            reset_req = data.get("reset_required", False)
+            if reset_req or (last_id > latest_on_server):
+                logger.info(f"Sync event pointer reset (local={last_id}, server={latest_on_server}, reset_req={reset_req}). Resetting to 0.")
                 self.db.set_setting("last_pulled_sync_event_id", "0")
                 return self.pull_updates(residence_id, base_url, is_directorate=is_directorate)
 
@@ -268,6 +270,10 @@ class SyncService:
                                 existing = conn.execute("SELECT id FROM exit_vouchers WHERE voucher_number = ? AND residence_id = ?", (v_num, r_id)).fetchone()
                         if not existing:
                             stk.create_exit_voucher(v_obj, payload.get("items", []))
+                        applied_count += 1
+                    elif entity_type == "residence_full_push":
+                        # حدث رفع حزمة شاملة من إقامة: سحب وتطبيق حزمة الإقامة المعنية فوراً
+                        self.pull_full_residence_data(r_id, base_url=url)
                         applied_count += 1
                 except Exception as ev_err:
                     logger.warning(f"Error applying pulled sync event {ev.get('id')}: {ev_err}")
@@ -579,6 +585,189 @@ class SyncService:
             logger.exception("Error in restore_residence_from_db_file")
             return {"success": False, "error": f"فشل استخراج البيانات من ملف قاعدة البيانات: {str(e)}"}
 
+    def push_full_residence_data(self, residence_id: int, base_url: Optional[str] = None) -> Dict[str, Any]:
+        """
+        رفع وتثبيت الحزمة الكاملة لبيانات إقامة محددة مباشرة إلى خادم المديرية المركزي.
+        يأخذ كافة السجلات المحلية للإقامة ويرسلها في حزمة واحدة.
+        """
+        url = base_url or AppConfig.get_server_url()
+        timeout = AppConfig.get("timeout_seconds", 60.0)
+
+        try:
+            with self.db.get_connection() as conn:
+                res_row = conn.execute("SELECT id, name FROM residences WHERE id = ?", (residence_id,)).fetchone()
+                res_name = res_row["name"] if res_row else f"الإقامة {residence_id}"
+
+                cur = conn.execute("SELECT * FROM daily_meals_tracking WHERE residence_id = ?", (residence_id,))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                meals = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                cur = conn.execute("SELECT * FROM entry_vouchers WHERE residence_id = ?", (residence_id,))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                entry_vouchers = [dict(zip(cols, r)) for r in cur.fetchall()]
+                ev_ids = [v["id"] for v in entry_vouchers]
+                entry_items = []
+                if ev_ids:
+                    placeholders = ",".join("?" for _ in ev_ids)
+                    cur_it = conn.execute(f"SELECT * FROM entry_voucher_items WHERE voucher_id IN ({placeholders})", tuple(ev_ids))
+                    it_cols = [c[0] for c in cur_it.description] if cur_it.description else []
+                    entry_items = [dict(zip(it_cols, r)) for r in cur_it.fetchall()]
+
+                cur = conn.execute("SELECT * FROM exit_vouchers WHERE residence_id = ?", (residence_id,))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                exit_vouchers = [dict(zip(cols, r)) for r in cur.fetchall()]
+                ex_ids = [v["id"] for v in exit_vouchers]
+                exit_items = []
+                if ex_ids:
+                    placeholders = ",".join("?" for _ in ex_ids)
+                    cur_it = conn.execute(f"SELECT * FROM exit_voucher_items WHERE voucher_id IN ({placeholders})", tuple(ex_ids))
+                    it_cols = [c[0] for c in cur_it.description] if cur_it.description else []
+                    exit_items = [dict(zip(it_cols, r)) for r in cur_it.fetchall()]
+
+                cur = conn.execute("SELECT * FROM stock_movements WHERE residence_id = ?", (residence_id,))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                movements = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                cur = conn.execute("SELECT * FROM residence_articles WHERE residence_id = ?", (residence_id,))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                res_articles = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                cur = conn.execute("SELECT * FROM residence_loans WHERE from_residence_id = ? OR to_residence_id = ?", (residence_id, residence_id))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                loans = [dict(zip(cols, r)) for r in cur.fetchall()]
+                loan_ids = [l["id"] for l in loans]
+                loan_items = []
+                if loan_ids:
+                    placeholders = ",".join("?" for _ in loan_ids)
+                    cur_it = conn.execute(f"SELECT * FROM residence_loan_items WHERE loan_id IN ({placeholders})", tuple(loan_ids))
+                    it_cols = [c[0] for c in cur_it.description] if cur_it.description else []
+                    loan_items = [dict(zip(it_cols, r)) for r in cur_it.fetchall()]
+
+                cur = conn.execute("SELECT * FROM inventory_snapshots WHERE residence_id = ?", (residence_id,))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                inventories = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                cur = conn.execute("SELECT * FROM unlocked_days WHERE residence_id = ?", (residence_id,))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                unlocked = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                cur = conn.execute("SELECT * FROM supplier_allocations WHERE residence_id = ?", (residence_id,))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                allocations = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                cur = conn.execute("SELECT * FROM bon_commande WHERE residence_id = ?", (residence_id,))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                bon_commandes = [dict(zip(cols, r)) for r in cur.fetchall()]
+                bc_ids = [b["id"] for b in bon_commandes]
+                bon_quantities = []
+                if bc_ids:
+                    placeholders = ",".join("?" for _ in bc_ids)
+                    cur_it = conn.execute(f"SELECT * FROM bon_commande_qty WHERE bon_id IN ({placeholders})", tuple(bc_ids))
+                    it_cols = [c[0] for c in cur_it.description] if cur_it.description else []
+                    bon_quantities = [dict(zip(it_cols, r)) for r in cur_it.fetchall()]
+
+            payload = {
+                "residence_id": residence_id,
+                "data": {
+                    "daily_meals_tracking": meals,
+                    "entry_vouchers": entry_vouchers,
+                    "entry_voucher_items": entry_items,
+                    "exit_vouchers": exit_vouchers,
+                    "exit_voucher_items": exit_items,
+                    "stock_movements": movements,
+                    "residence_articles": res_articles,
+                    "residence_loans": loans,
+                    "residence_loan_items": loan_items,
+                    "inventory_snapshots": inventories,
+                    "unlocked_days": unlocked,
+                    "supplier_allocations": allocations,
+                    "bon_commande": bon_commandes,
+                    "bon_commande_qty": bon_quantities
+                }
+            }
+
+            endpoint = f"{url}/api/sync/residence_full_push"
+            logger.info(f"Pushing full residence data to {endpoint} ({len(meals)} meals, {len(entry_vouchers)} entry, {len(exit_vouchers)} exit)...")
+            r = http_post(endpoint, json=payload, timeout=timeout)
+            if r.status_code == 200:
+                res_data = r.json()
+                if res_data.get("success"):
+                    with self.db.get_connection() as conn:
+                        now_str = TimeService.iso_now() if TimeService else datetime.datetime.now().isoformat()
+                        conn.execute("UPDATE sync_queue SET status = 'SYNCED', synced_at = ? WHERE residence_id = ?", (now_str, residence_id))
+                        conn.commit()
+                    return {
+                        "success": True,
+                        "residence_id": residence_id,
+                        "residence_name": res_name,
+                        "counts": {
+                            "daily_meals_tracking": len(meals),
+                            "entry_vouchers": len(entry_vouchers),
+                            "exit_vouchers": len(exit_vouchers),
+                            "stock_movements": len(movements)
+                        }
+                    }
+                else:
+                    return {"success": False, "error": res_data.get("error", "فشل غير معروف من السيرفر")}
+            else:
+                return {"success": False, "error": f"استجابة غير صحيحة من السيرفر (كود: {r.status_code})"}
+        except Exception as e:
+            logger.exception("Error in push_full_residence_data")
+            return {"success": False, "error": f"تعذر رفع البيانات: {e}"}
+
+    def check_and_enforce_parity(self, base_url: Optional[str] = None) -> Dict[str, Any]:
+        """
+        التحقق التلقائي الذكي من تطابق بيانات كافة الإقامات بين قاعدة البيانات المحلية وخادم المديرية.
+        إذا كان أي حاسوب مديرية تنقصه بيانات لأي إقامة، يتم سحبها فوراً وتحديثها لضمان التطابق التام 100%.
+        """
+        url = base_url or AppConfig.get_server_url()
+        try:
+            r = http_get(f"{url}/api/sync/summary", timeout=15.0)
+            if r.status_code != 200:
+                return {"success": False, "error": f"Server summary error: {r.status_code}"}
+            sum_data = r.json()
+            if not sum_data.get("success"):
+                return {"success": False, "error": "Summary failed"}
+
+            server_residences = sum_data.get("residences", {})
+            out_of_sync = []
+
+            with self.db.get_connection() as conn:
+                for rid_str, s_info in server_residences.items():
+                    rid = int(rid_str)
+                    local_meals = conn.execute("SELECT COUNT(*) FROM daily_meals_tracking WHERE residence_id = ?", (rid,)).fetchone()[0]
+                    local_entry = conn.execute("SELECT COUNT(*) FROM entry_vouchers WHERE residence_id = ?", (rid,)).fetchone()[0]
+                    local_exit = conn.execute("SELECT COUNT(*) FROM exit_vouchers WHERE residence_id = ?", (rid,)).fetchone()[0]
+
+                    if (local_meals < s_info.get("meals", 0) or
+                        local_entry < s_info.get("entry_vouchers", 0) or
+                        local_exit < s_info.get("exit_vouchers", 0)):
+                        out_of_sync.append((rid, s_info.get("name", f"الإقامة {rid}"), local_meals, s_info.get("meals", 0)))
+
+            synced_count = 0
+            if out_of_sync:
+                logger.info(f"Parity check: Found {len(out_of_sync)} residences out of sync: {out_of_sync}. Auto-syncing missing data...")
+                for rid, name, loc_m, srv_m in out_of_sync:
+                    pull_res = self.pull_full_residence_data(rid, base_url=url)
+                    if pull_res.get("success"):
+                        synced_count += 1
+                        logger.info(f"Parity restored for Residence {rid} ({name})")
+
+            server_max = sum_data.get("server_max_sync_event_id", 0)
+            if server_max:
+                curr_last = int(self.db.get_setting("last_pulled_sync_event_id", "0") or "0")
+                if curr_last > server_max or curr_last == 0:
+                    self.db.set_setting("last_pulled_sync_event_id", str(server_max))
+
+            return {
+                "success": True,
+                "out_of_sync_count": len(out_of_sync),
+                "synced_count": synced_count
+            }
+        except Exception as e:
+            logger.warning(f"Notice parity check: {e}")
+            return {"success": False, "error": str(e)}
+
     def sync_all_residences_from_server(self, base_url: Optional[str] = None, progress_cb: Optional[Any] = None) -> Dict[str, Any]:
         """
         تحديث ومزامنة شاملة لكافة الإقامات التسع من الخادم المركزي للمديرية.
@@ -753,34 +942,54 @@ class SyncWorker(QThread):
 
                     if is_dir_server:
                         # ═══════════════════════════════════════════════════════
-                        # وضع المديرية المركزية: سحب وتحديث بيانات كافة الإقامات
+                        # وضع المديرية المركزية: تطابق تام لكافة حواسيب المديرية
                         # ═══════════════════════════════════════════════════════
-                        # 1. إذا كان مؤشر المزامنة 0 أو طُلب تحديث شامل لكافة الإقامات
-                        last_id = int(self.sync_svc.db.get_setting("last_pulled_sync_event_id", "0") or "0")
-                        if last_id == 0 or getattr(self, "_force_full_sync", False):
+                        # 1. التحقق التلقائي الذكي من تطابق كافة الإقامات (Parity Check) عند بدء التشغيل أو بطلب دوري
+                        self._dir_cycle_count = getattr(self, "_dir_cycle_count", 0) + 1
+                        if not getattr(self, "_dir_startup_parity_done", False) or self._dir_cycle_count % 30 == 0 or getattr(self, "_force_full_sync", False):
+                            self._dir_startup_parity_done = True
                             self._force_full_sync = False
-                            logger.info("SyncWorker: Initializing complete data sync for all 9 residences on Directorate station...")
-                            full_sync_res = self.sync_svc.sync_all_residences_from_server()
-                            if full_sync_res.get("success"):
-                                pulled += full_sync_res.get("synced_count", 0)
+                            parity_res = self.sync_svc.check_and_enforce_parity()
+                            if parity_res.get("synced_count", 0) > 0:
+                                pulled += parity_res.get("synced_count", 0)
                                 self.new_residence_data_received.emit(pulled)
 
-                        # 2. سحب الحركات التزايدية المستمرة من الإقامات
+                        # 2. سحب الحركات التزايدية المستمرة من الإقامات فورياً
                         pulled_inc = self.sync_svc.pull_updates(residence_id=None, is_directorate=True)
                         if pulled_inc > 0:
                             pulled += pulled_inc
                             self.new_residence_data_received.emit(pulled_inc)
 
-                        # وفي حال تم تسجيل أي حركة في المديرية، تُرسل أيضاً
+                        # 3. إرسال أي حركات مسجلة من المديرية
                         pending_cnt = self.sync_svc.get_pending_count(None)
                         if pending_cnt > 0 or self._trigger_now:
                             pushed, _ = self.sync_svc.push_pending(None)
                     else:
                         # ═══════════════════════════════════════════════════════
-                        # وضع الإقامة: إرسال (push) فقط إلى المديرية
-                        # الإقامة لا تسحب أي بيانات من أي مصدر آخر لحماية مدخلاتها
+                        # وضع الإقامة: الاسترجاع التلقائي عند التسطيب الجديد + إرسال
                         # ═══════════════════════════════════════════════════════
                         res_id = self.residence_id or AppConfig.get("residence_id")
+
+                        # التحقق الذكي: إذا كان الحاسوب جديداً أو فارغاً (0 وجبات مسجلة محلياً للإقامة)
+                        if res_id and not getattr(self, "_residence_restore_checked", False):
+                            self._residence_restore_checked = True
+                            try:
+                                with self.sync_svc.db.get_connection() as conn:
+                                    m_cnt = conn.execute("SELECT COUNT(*) FROM daily_meals_tracking WHERE residence_id = ?", (int(res_id),)).fetchone()[0]
+                                if m_cnt == 0:
+                                    logger.info(f"SyncWorker: Residence {res_id} has 0 local meals. Auto-checking Directorate server for existing data...")
+                                    restore_res = self.sync_svc.pull_full_residence_data(int(res_id))
+                                    if restore_res.get("success"):
+                                        counts = restore_res.get("counts", {})
+                                        retrieved_meals = counts.get("daily_meals_tracking", 0)
+                                        if retrieved_meals > 0:
+                                            logger.info(f"SyncWorker: Successfully auto-restored {retrieved_meals} meals for residence {res_id} from Directorate!")
+                                            self.new_residence_data_received.emit(retrieved_meals)
+                                            self.sync_finished.emit(retrieved_meals, 0)
+                            except Exception as e_rst:
+                                logger.warning(f"Notice residence auto-restore check: {e_rst}")
+
+                        # إرسال الحركات المحفوظة محلياً في الرتل
                         pending_cnt = self.sync_svc.get_pending_count(res_id)
                         if pending_cnt > 0 or self._trigger_now:
                             pushed, _ = self.sync_svc.push_pending(res_id)
