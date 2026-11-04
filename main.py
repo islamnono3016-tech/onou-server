@@ -7,6 +7,28 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
+# تفعيل أولوية تحميل حزم وتحديثات بايثون النقية من القرص (ui, core, database, reports)
+import importlib.util
+import importlib.abc
+
+_APP_PACKAGES = ("ui", "core", "database", "reports")
+
+class _DiskOverrideFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        prefix = fullname.split(".")[0]
+        if prefix in _APP_PACKAGES:
+            rel_parts = fullname.split(".")
+            rel_file = os.path.join(BASE_DIR, *rel_parts) + ".py"
+            rel_pkg = os.path.join(BASE_DIR, *rel_parts, "__init__.py")
+            if os.path.isfile(rel_file):
+                return importlib.util.spec_from_file_location(fullname, rel_file)
+            elif os.path.isfile(rel_pkg):
+                return importlib.util.spec_from_file_location(fullname, rel_pkg, submodule_search_locations=[os.path.dirname(rel_pkg)])
+        return None
+
+if getattr(sys, "frozen", False):
+    sys.meta_path.insert(0, _DiskOverrideFinder())
+
 
 
 
