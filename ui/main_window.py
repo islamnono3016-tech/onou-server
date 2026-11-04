@@ -773,12 +773,8 @@ class MainWindow(QMainWindow):
         is_admin = self.is_directorate_session()
         offset = 1 if is_admin else 0
 
-        # حماية واجهة النسخ الاحتياطي والإعدادات بكود المديرية الموحد
-        if index == (11 + offset) and not is_admin:
-            from ui.widgets.directorate_auth_dialog import DirectorateAuthDialog
-            if not DirectorateAuthDialog.verify(self, "الدخول إلى واجهة النسخ الاحتياطي والإعدادات", self.db):
-                self._restore_nav_button(curr_idx)
-                return
+        # إتاحة واجهة الإعدادات لكافة المستخدمين بما في ذلك مسؤولي الإقامات
+        # لتمكينهم من سحب واسترجاع بيانات إقامتهم في الأجهزة الجديدة دون قفل
 
         # 1. التبديل البصري الفوري بنقرة واحدة دون أي تجميد (0 ميلي ثانية)
         self.stack.setCurrentIndex(index)

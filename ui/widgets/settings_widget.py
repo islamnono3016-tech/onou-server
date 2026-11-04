@@ -203,6 +203,107 @@ class SettingsWidget(QWidget):
         # -------------------------------------------------------------
         # 1. إعدادات المؤسسة والنظام
         # -------------------------------------------------------------
+        # -------------------------------------------------------------
+        # 6. سحب واسترجاع بيانات الإقامة من المديرية (عزل تام وشامل)
+        # -------------------------------------------------------------
+        pull_panel = QFrame()
+        pull_panel.setProperty("class", "content-panel")
+        pp_layout = QVBoxLayout(pull_panel)
+
+        pp_title = QLabel("سحب واسترجاع بيانات الإقامة من المديرية 📥")
+        pp_title.setProperty("class", "section-title")
+        pp_layout.addWidget(pp_title)
+
+        pp_card = QFrame()
+        pp_card.setStyleSheet(
+            "background-color: rgba(15, 23, 42, 0.7); "
+            "border: 1.5px solid #0EA5E9; "
+            "border-radius: 8px; padding: 14px;"
+        )
+        pp_card_l = QVBoxLayout(pp_card)
+        pp_card_l.setSpacing(10)
+
+        # اختيار الإقامة المستهدفة بالسحب عبر قائمة منسدلة واضحة
+        res_sel_layout = QHBoxLayout()
+        res_sel_layout.setSpacing(10)
+        lbl_res_sel = QLabel("🏢 اختر الإقامة المراد سحب واسترجاع كافة بياناتها من المديرية:")
+        lbl_res_sel.setStyleSheet("color: #F8FAFC; font-weight: bold; font-size: 13px;")
+        res_sel_layout.addWidget(lbl_res_sel)
+
+        self.cmb_pull_residence = QComboBox()
+        self.cmb_pull_residence.setStyleSheet(
+            "background-color: #0F172A; color: #38BDF8; font-weight: bold; font-size: 13px; "
+            "border: 1.5px solid #0EA5E9; padding: 6px 14px; border-radius: 6px;"
+        )
+        curr_t_id = self.get_target_residence_id()
+        try:
+            with self.db.get_connection() as conn:
+                res_rows = conn.execute("SELECT id, name, code FROM residences ORDER BY id ASC").fetchall()
+                for r in res_rows:
+                    self.cmb_pull_residence.addItem(f"{r['name']} (معرف رقم: {r['id']})", r['id'])
+        except Exception:
+            pass
+
+        for idx in range(self.cmb_pull_residence.count()):
+            if self.cmb_pull_residence.itemData(idx) == curr_t_id:
+                self.cmb_pull_residence.setCurrentIndex(idx)
+                break
+
+        res_sel_layout.addWidget(self.cmb_pull_residence)
+        pp_card_l.addLayout(res_sel_layout)
+
+        # التنبيه والإيضاح
+        lbl_pull_desc = QLabel(
+            "تتيح هذه الخاصية سحب واسترجاع كافة البيانات التاريخية للإقامة المحددة أعلاه دفعة واحدة من قاعدة بيانات المديرية "
+            "(وصولات الدخول، وصولات الخروج، بطاقات اليومية للوجبات، حركات المخزون، وأرصدة المواد).\n"
+            "🔒 العملية يدوية تماماً وتتمتع بنظام العزل التام: لا تمس ولا تسحب أي بيانات تخص الإقامات الأخرى إطلاقاً."
+        )
+        lbl_pull_desc.setStyleSheet("color: #E2E8F0; font-size: 11px; line-height: 1.4;")
+        lbl_pull_desc.setWordWrap(True)
+        pp_card_l.addWidget(lbl_pull_desc)
+
+        # أزرار السحب الثلاثية (سحابي ذكي + أوفلاين فوري + ملف مخصص)
+        btn_box = QHBoxLayout()
+        btn_box.setSpacing(10)
+
+        self.btn_pull_residence = QPushButton("📥 سحب جميع بيانات إقامتي من بيانات المديرية (سحابي / محلي)")
+        self.btn_pull_residence.setStyleSheet(
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0284C7, stop:1 #0EA5E9); "
+            "color: #FFFFFF; font-weight: bold; padding: 10px 16px; border-radius: 6px; font-size: 12px;"
+        )
+        self.btn_pull_residence.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_pull_residence.clicked.connect(self.on_pull_residence_clicked)
+        btn_box.addWidget(self.btn_pull_residence)
+
+        self.btn_pull_instant_offline = QPushButton("⚡ استرجاع فوري لبيانات الإقامة (أوفلاين بدون إنترنت)")
+        self.btn_pull_instant_offline.setStyleSheet(
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #10B981); "
+            "color: #FFFFFF; font-weight: bold; padding: 10px 16px; border-radius: 6px; font-size: 12px;"
+        )
+        self.btn_pull_instant_offline.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_pull_instant_offline.clicked.connect(self.on_pull_instant_offline_clicked)
+        btn_box.addWidget(self.btn_pull_instant_offline)
+
+        self.btn_pull_res_file = QPushButton("📂 اختيار ملف DB (USB)")
+        self.btn_pull_res_file.setStyleSheet(
+            "background-color: #1E293B; border: 1px solid #475569; color: #CBD5E1; "
+            "font-weight: bold; padding: 10px 12px; border-radius: 6px; font-size: 11px;"
+        )
+        self.btn_pull_res_file.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_pull_res_file.clicked.connect(self.on_pull_residence_from_file_clicked)
+        btn_box.addWidget(self.btn_pull_res_file)
+
+        pp_card_l.addLayout(btn_box)
+
+        # تسمية الحالة والتقدم
+        self.lbl_pull_status = QLabel("")
+        self.lbl_pull_status.setStyleSheet("font-size: 12px; color: #38BDF8;")
+        self.lbl_pull_status.setWordWrap(True)
+        pp_card_l.addWidget(self.lbl_pull_status)
+
+        pp_layout.addWidget(pp_card)
+        layout.addWidget(pull_panel)
+
         settings_panel = QFrame()
         settings_panel.setProperty("class", "content-panel")
         s_layout = QVBoxLayout(settings_panel)
@@ -601,106 +702,6 @@ class SettingsWidget(QWidget):
         dcp_layout.addWidget(dcp_card)
         layout.addWidget(dir_code_panel)
 
-        # -------------------------------------------------------------
-        # 6. سحب واسترجاع بيانات الإقامة من المديرية (عزل تام وشامل)
-        # -------------------------------------------------------------
-        pull_panel = QFrame()
-        pull_panel.setProperty("class", "content-panel")
-        pp_layout = QVBoxLayout(pull_panel)
-
-        pp_title = QLabel("سحب واسترجاع بيانات الإقامة من المديرية 📥")
-        pp_title.setProperty("class", "section-title")
-        pp_layout.addWidget(pp_title)
-
-        pp_card = QFrame()
-        pp_card.setStyleSheet(
-            "background-color: rgba(15, 23, 42, 0.7); "
-            "border: 1.5px solid #0EA5E9; "
-            "border-radius: 8px; padding: 14px;"
-        )
-        pp_card_l = QVBoxLayout(pp_card)
-        pp_card_l.setSpacing(10)
-
-        # اختيار الإقامة المستهدفة بالسحب عبر قائمة منسدلة واضحة
-        res_sel_layout = QHBoxLayout()
-        res_sel_layout.setSpacing(10)
-        lbl_res_sel = QLabel("🏢 اختر الإقامة المراد سحب واسترجاع كافة بياناتها من المديرية:")
-        lbl_res_sel.setStyleSheet("color: #F8FAFC; font-weight: bold; font-size: 13px;")
-        res_sel_layout.addWidget(lbl_res_sel)
-
-        self.cmb_pull_residence = QComboBox()
-        self.cmb_pull_residence.setStyleSheet(
-            "background-color: #0F172A; color: #38BDF8; font-weight: bold; font-size: 13px; "
-            "border: 1.5px solid #0EA5E9; padding: 6px 14px; border-radius: 6px;"
-        )
-        curr_t_id = self.get_target_residence_id()
-        try:
-            with self.db.get_connection() as conn:
-                res_rows = conn.execute("SELECT id, name, code FROM residences ORDER BY id ASC").fetchall()
-                for r in res_rows:
-                    self.cmb_pull_residence.addItem(f"{r['name']} (معرف رقم: {r['id']})", r['id'])
-        except Exception:
-            pass
-
-        for idx in range(self.cmb_pull_residence.count()):
-            if self.cmb_pull_residence.itemData(idx) == curr_t_id:
-                self.cmb_pull_residence.setCurrentIndex(idx)
-                break
-
-        res_sel_layout.addWidget(self.cmb_pull_residence)
-        pp_card_l.addLayout(res_sel_layout)
-
-        # التنبيه والإيضاح
-        lbl_pull_desc = QLabel(
-            "تتيح هذه الخاصية سحب واسترجاع كافة البيانات التاريخية للإقامة المحددة أعلاه دفعة واحدة من قاعدة بيانات المديرية "
-            "(وصولات الدخول، وصولات الخروج، بطاقات اليومية للوجبات، حركات المخزون، وأرصدة المواد).\n"
-            "🔒 العملية يدوية تماماً وتتمتع بنظام العزل التام: لا تمس ولا تسحب أي بيانات تخص الإقامات الأخرى إطلاقاً."
-        )
-        lbl_pull_desc.setStyleSheet("color: #E2E8F0; font-size: 11px; line-height: 1.4;")
-        lbl_pull_desc.setWordWrap(True)
-        pp_card_l.addWidget(lbl_pull_desc)
-
-        # أزرار السحب الثلاثية (سحابي ذكي + أوفلاين فوري + ملف مخصص)
-        btn_box = QHBoxLayout()
-        btn_box.setSpacing(10)
-
-        self.btn_pull_residence = QPushButton("📥 سحب جميع بيانات إقامتي من بيانات المديرية (سحابي / محلي)")
-        self.btn_pull_residence.setStyleSheet(
-            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0284C7, stop:1 #0EA5E9); "
-            "color: #FFFFFF; font-weight: bold; padding: 10px 16px; border-radius: 6px; font-size: 12px;"
-        )
-        self.btn_pull_residence.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_pull_residence.clicked.connect(self.on_pull_residence_clicked)
-        btn_box.addWidget(self.btn_pull_residence)
-
-        self.btn_pull_instant_offline = QPushButton("⚡ استرجاع فوري لبيانات الإقامة (أوفلاين بدون إنترنت)")
-        self.btn_pull_instant_offline.setStyleSheet(
-            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #10B981); "
-            "color: #FFFFFF; font-weight: bold; padding: 10px 16px; border-radius: 6px; font-size: 12px;"
-        )
-        self.btn_pull_instant_offline.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_pull_instant_offline.clicked.connect(self.on_pull_instant_offline_clicked)
-        btn_box.addWidget(self.btn_pull_instant_offline)
-
-        self.btn_pull_res_file = QPushButton("📂 اختيار ملف DB (USB)")
-        self.btn_pull_res_file.setStyleSheet(
-            "background-color: #1E293B; border: 1px solid #475569; color: #CBD5E1; "
-            "font-weight: bold; padding: 10px 12px; border-radius: 6px; font-size: 11px;"
-        )
-        self.btn_pull_res_file.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_pull_res_file.clicked.connect(self.on_pull_residence_from_file_clicked)
-        btn_box.addWidget(self.btn_pull_res_file)
-
-        pp_card_l.addLayout(btn_box)
-
-        # تسمية الحالة والتقدم
-        self.lbl_pull_status = QLabel("")
-        self.lbl_pull_status.setStyleSheet("font-size: 12px; color: #38BDF8;")
-        self.lbl_pull_status.setWordWrap(True)
-        pp_card_l.addWidget(self.lbl_pull_status)
-
-        pp_layout.addWidget(pp_card)
-        layout.addWidget(pull_panel)
 
         # -------------------------------------------------------------
         # 5. أداة ترحيل ملفات الإكسل القديمة

@@ -7,6 +7,16 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
+# إعطاء الأولوية لملفات الكود المحدثة على القرص على حساب الحزم المجمدة داخل PyInstaller
+# يضمن هذا تطبيق كافة ملفات التحديث (dou_patch) على مجلدات ui و core و database فوراً
+try:
+    from importlib.machinery import PathFinder
+    if PathFinder in sys.meta_path:
+        sys.meta_path.remove(PathFinder)
+    sys.meta_path.insert(0, PathFinder)
+except Exception:
+    pass
+
 
 # تهيئة مسارات مكتبات DLL لـ Qt (PyQt5 / PyQt6) لضمان العمل على Windows 7 و 8 و 10 و 11
 for _dll_p in [
