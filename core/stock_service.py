@@ -1,3 +1,7 @@
+try:
+    from core.time_service import TimeService
+except Exception:
+    TimeService = None
 import sqlite3
 import datetime
 import math
@@ -144,7 +148,7 @@ class StockService:
                             qty_in, qty_out, unit_price, total_value, balance_after
                         ) VALUES (?, ?, 'INITIAL', NULL, ?, 0, ?, ?, ?)
                     """, (
-                        datetime.date.today().isoformat(), article_id,
+                        (TimeService.today_str() if TimeService else datetime.date.today().isoformat()), article_id,
                         initial_stock, price_ttc, initial_stock * price_ttc, initial_stock
                     ))
             conn.commit()
@@ -301,7 +305,7 @@ class StockService:
         توليد رقم تسلسلي تلقائي ومنظم للوصولات لمنع تكرار أو تداخل الأرقام
         (مثال: BE-2026-0001 أو BS-2026-0001)
         """
-        target_year = year or datetime.date.today().year
+        target_year = year or (TimeService.today().year if TimeService else datetime.date.today().year)
         prefix = "BE" if voucher_kind.upper() == "ENTRY" else "BS"
         tbl = "entry_vouchers" if voucher_kind.upper() == "ENTRY" else "exit_vouchers"
         r_id = self.residence_id
@@ -489,8 +493,8 @@ class StockService:
             rep_year = int(year or d_start.year)
             rep_month = int(month or d_start.month)
         else:
-            rep_year = int(year or datetime.date.today().year)
-            rep_month = int(month or datetime.date.today().month)
+            rep_year = int(year or (TimeService.today().year if TimeService else datetime.date.today().year))
+            rep_month = int(month or (TimeService.today().month if TimeService else datetime.date.today().month))
             if rep_month in [1, 3, 5, 7, 8, 10, 12]:
                 last_day = 31
             elif rep_month in [4, 6, 9, 11]:
@@ -644,8 +648,8 @@ class StockService:
             d_start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
             d_end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
         else:
-            rep_year = int(year or datetime.date.today().year)
-            rep_month = int(month or datetime.date.today().month)
+            rep_year = int(year or (TimeService.today().year if TimeService else datetime.date.today().year))
+            rep_month = int(month or (TimeService.today().month if TimeService else datetime.date.today().month))
             if rep_month in [1, 3, 5, 7, 8, 10, 12]: last_day = 31
             elif rep_month in [4, 6, 9, 11]: last_day = 30
             else: last_day = 29 if (rep_year % 4 == 0 and (rep_year % 100 != 0 or rep_year % 400 == 0)) else 28
@@ -787,7 +791,7 @@ class StockService:
             low_stock_count = low_stock_row[0] if (low_stock_row and low_stock_row[0] is not None) else 0
 
             # 4. مصاريف إطعام اليوم الحالي للإقامة المحددة
-            today_str = datetime.date.today().isoformat()
+            today_str = TimeService.today_str() if TimeService else datetime.date.today().isoformat()
             today_expense = conn.execute("""
                 SELECT COALESCE(daily_food_expense, 0)
                 FROM daily_meals_tracking
@@ -991,6 +995,81 @@ class StockService:
                 "grand_total_expense": grand_total_expense,
                 "meals": meal_data
             }
+
+    def get_latest_active_date(self, residence_id: Optional[int] = None) -> Optional[str]:
+        """
+        الحصول على آخر تاريخ مسجل به بيانات استهلاك (خروج مطبخ) أو تتبع تذاكر الوجبات أو حركات مخزون للإقامة.
+        يضمن التحويل التلقائي للتواريخ المسجلة حتى لا يفتح البرنامج على شاشة فارغة.
+        """
+        r_id = residence_id or self.residence_id
+        with self.db.get_connection() as conn:
+            cur = conn.execute("""
+                SELECT MAX(d) FROM (
+                    SELECT MAX(date) as d FROM exit_vouchers WHERE residence_id = ? AND voucher_type = 'KITCHEN'
+                    UNION
+                    SELECT MAX(date) as d FROM daily_meals_tracking WHERE residence_id = ? AND (bf_total > 0 OR lu_total > 0 OR di_total > 0)
+                    UNION
+                    SELECT MAX(date) as d FROM entry_vouchers WHERE residence_id = ?
+                    UNION
+                    SELECT MAX(date) as d FROM stock_movements WHERE residence_id = ?
+                )
+            """, (r_id, r_id, r_id, r_id))
+            row = cur.fetchone()
+            if row and row[0]:
+                return str(row[0])
+            return None
+
+    def get_active_dates_in_month(self, year_month: str, residence_id: Optional[int] = None) -> List[str]:
+        """
+        جلب قائمة التواريخ النشطة (التي تحتوي على حركات استهلاك مطبخ أو تذاكر وجبات) في شهر محدد.
+        تُستخدم لتلوين أزرار الأيام (01 إلى 31) بالأخضر لتمييز الأيام المسجلة فورياً.
+        """
+        r_id = residence_id or self.residence_id
+        with self.db.get_connection() as conn:
+            cur = conn.execute("""
+                SELECT DISTINCT date FROM exit_vouchers 
+                WHERE residence_id = ? AND voucher_type = 'KITCHEN' AND strftime('%Y-%m', date) = ?
+                UNION
+                SELECT DISTINCT date FROM daily_meals_tracking
+                WHERE residence_id = ? AND (bf_total > 0 OR lu_total > 0 OR di_total > 0) AND strftime('%Y-%m', date) = ?
+                ORDER BY date ASC
+            """, (r_id, year_month, r_id, year_month))
+            return [str(r[0]) for r in cur.fetchall() if r[0]]
+
+    def get_available_months_with_data(self, residence_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        جلب قائمة الأشهر المتاحة التي تحتوي على بيانات استهلاك أو تذاكر مسجلة للإقامة،
+        مع إحصائية عدد الأيام المسجلة في كل شهر.
+        """
+        r_id = residence_id or self.residence_id
+        with self.db.get_connection() as conn:
+            cur = conn.execute("""
+                SELECT strftime('%Y-%m', date) as ym, COUNT(DISTINCT date) as cnt
+                FROM (
+                    SELECT date FROM exit_vouchers WHERE residence_id = ? AND voucher_type = 'KITCHEN'
+                    UNION
+                    SELECT date FROM daily_meals_tracking WHERE residence_id = ? AND (bf_total > 0 OR lu_total > 0 OR di_total > 0)
+                )
+                WHERE ym IS NOT NULL
+                GROUP BY ym
+                ORDER BY ym DESC
+            """, (r_id, r_id))
+            months = []
+            arabic_months = {
+                "01": "جانفي", "02": "فيفري", "03": "مارس", "04": "أفريل",
+                "05": "ماي", "06": "جوان", "07": "جويلية", "08": "أوت",
+                "09": "سبتمبر", "10": "أكتوبر", "11": "نوفمبر", "12": "ديسمبر"
+            }
+            for r in cur.fetchall():
+                ym = r["ym"]
+                cnt = r["cnt"]
+                parts = ym.split("-")
+                if len(parts) == 2:
+                    y, m = parts
+                    m_name = arabic_months.get(m, m)
+                    label = f"{m_name} {y} ({cnt} يوماً مسجلاً)"
+                    months.append({"ym": ym, "year": int(y), "month": int(m), "label": label, "count": cnt})
+            return months
 
     def save_daily_sheet_full(self, date_str: str, articles_input: List[Dict[str, Any]], tickets_input: Optional[Dict[str, Any]] = None, menu_input: Optional[Dict[str, str]] = None, residence_id: Optional[int] = None, notes: Optional[str] = None) -> None:
         """حفظ ورقة اليوم بالكامل: الاستهلاك، التوريد، التذاكر، وتحديث الأرصدة دفعة واحدة"""
@@ -1551,7 +1630,7 @@ class StockService:
             start_date_str = start_date
             end_date_str = end_date
         else:
-            rep_year = year or datetime.date.today().year
+            rep_year = year or (TimeService.today().year if TimeService else datetime.date.today().year)
             tri = trimester or 1
             if tri == 1:
                 months = (1, 2, 3)
@@ -1983,7 +2062,7 @@ class StockService:
     # -------------------------------------------------------------
     def get_next_loan_number(self, year: Optional[int] = None) -> str:
         """توليد رقم تسلسلي لإعارة المواد بين الإقامات (مثال: LOAN-2026-0001)"""
-        target_year = year or datetime.date.today().year
+        target_year = year or (TimeService.today().year if TimeService else datetime.date.today().year)
         with self.db.get_connection() as conn:
             cnt = conn.execute(
                 "SELECT COUNT(*) FROM residence_loans WHERE date LIKE ?",
@@ -2462,7 +2541,7 @@ class StockService:
                 conn.execute("DELETE FROM entry_vouchers WHERE id = ?", (entry_v_id,))
 
             # تحديث حالة الإعارة وملاحظات التدقيق
-            now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+            now_str = (TimeService.now() if TimeService else datetime.datetime.now()).strftime('%Y-%m-%d %H:%M')
             audit_msg = f"تم إرجاع الإعارة وتصحيح المخزون بقرار من المديرية ({reverted_by}) بتاريخ {now_str}"
             if reason:
                 audit_msg += f" [السبب: {reason}]"

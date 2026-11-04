@@ -28,6 +28,42 @@ class MigrationWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
+def get_candidate_official_dbs():
+    import string
+    candidates = []
+    from database.db_manager import BASE_DIR
+    for b in [BASE_DIR, os.path.dirname(sys.executable), os.path.abspath(os.path.join(os.path.dirname(sys.executable), ".."))]:
+        if b:
+            candidates.append(os.path.join(b, "database", "official_catering_stock.db"))
+            candidates.append(os.path.join(b, "data", "catering_stock.db"))
+            candidates.append(os.path.join(b, "official_catering_stock.db"))
+            candidates.append(os.path.join(b, "catering_stock.db"))
+    user_prof = os.environ.get("USERPROFILE", os.path.expanduser("~"))
+    desktop = os.path.join(user_prof, "Desktop")
+    candidates.append(os.path.join(desktop, "official_catering_stock.db"))
+    candidates.append(os.path.join(desktop, "catering_stock.db"))
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    if local_app:
+        candidates.append(os.path.join(local_app, "CateringStockONOU", "database", "official_catering_stock.db"))
+        candidates.append(os.path.join(local_app, "CateringStockONOU", "data", "catering_stock.db"))
+    for l in string.ascii_uppercase:
+        drive = f"{l}:\\"
+        if os.path.exists(drive):
+            candidates.append(os.path.join(drive, "official_catering_stock.db"))
+            candidates.append(os.path.join(drive, "catering_stock.db"))
+            candidates.append(os.path.join(drive, "pyinstaller_dist", "CateringStockONOU", "database", "official_catering_stock.db"))
+            candidates.append(os.path.join(drive, "CateringStockONOU", "data", "catering_stock.db"))
+            candidates.append(os.path.join(drive, "55", "CateringStockONOU", "database", "official_catering_stock.db"))
+            candidates.append(os.path.join(drive, "55", "official_catering_stock.db"))
+    seen = set()
+    valid = []
+    for c in candidates:
+        norm = os.path.abspath(c)
+        if norm not in seen and os.path.exists(norm) and os.path.getsize(norm) > 1000000:
+            seen.add(norm)
+            valid.append(norm)
+    return valid
+
 class PullResidenceWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
@@ -55,23 +91,14 @@ class PullResidenceWorker(QThread):
                 # 2. في حال فشل الاتصال بالشبكة (أوفلاين أو انقطاع أو مهلة)، السحب التلقائي من قاعدة البيانات الرسمية
                 if not res.get("success"):
                     _logger.warning(f"Online pull failed ({res.get('error')}), initiating smart offline fallback...")
-                    candidates = [
-                        r"H:\official_catering_stock.db",
-                        r"H:\catering_stock.db",
-                        os.path.join(r"C:\Users\pc\AppData\Local\CateringStockONOU", "database", "official_catering_stock.db"),
-                        r"H:\pyinstaller_dist\CateringStockONOU\database\official_catering_stock.db",
-                        r"H:\CateringStockONOU\data\catering_stock.db",
-                        r"C:\Users\pc\Desktop\official_catering_stock.db",
-                        r"C:\Users\pc\Desktop\catering_stock.db"
-                    ]
+                    candidates = get_candidate_official_dbs()
                     for cand in candidates:
-                        if os.path.exists(cand) and os.path.getsize(cand) > 1000000:
-                            fb_res = sync_svc.restore_residence_from_db_file(self.residence_id, cand)
-                            if fb_res.get("success"):
-                                fb_res["source_mode"] = "OFFLINE_FALLBACK"
-                                fb_res["source_file"] = cand
-                                res = fb_res
-                                break
+                        fb_res = sync_svc.restore_residence_from_db_file(self.residence_id, cand)
+                        if fb_res.get("success"):
+                            fb_res["source_mode"] = "OFFLINE_FALLBACK"
+                            fb_res["source_file"] = cand
+                            res = fb_res
+                            break
 
             if res.get("success"):
                 self.finished.emit(res)
@@ -1100,20 +1127,8 @@ class SettingsWidget(QWidget):
             return
 
         import os
-        candidates = [
-            r"H:\official_catering_stock.db",
-            r"H:\catering_stock.db",
-            os.path.join(r"C:\Users\pc\AppData\Local\CateringStockONOU", "database", "official_catering_stock.db"),
-            r"H:\pyinstaller_dist\CateringStockONOU\database\official_catering_stock.db",
-            r"C:\Users\pc\Desktop\official_catering_stock.db",
-            r"C:\Users\pc\Desktop\catering_stock.db",
-            r"H:\CateringStockONOU\data\catering_stock.db"
-        ]
-        target_db = None
-        for cand in candidates:
-            if os.path.exists(cand) and os.path.getsize(cand) > 1000000:
-                target_db = cand
-                break
+        candidates = get_candidate_official_dbs()
+        target_db = candidates[0] if candidates else None
 
         if not target_db:
             QMessageBox.warning(
@@ -1190,16 +1205,16 @@ class SettingsWidget(QWidget):
             f"✅ تم سحب واسترجاع جميع بيانات إقامتك من بيانات المديرية بنجاح!\n\n"
             f"🏢 الإقامة المسترجعة: {r_name} (رقم: {r_id})\n"
             f"🌐 طريقة السحب: {mode_text.strip()}\n\n"
-            f"📊 إحصائيات البيانات المسترجعة:\n"
-            f"  • أوراق الوجبات اليومية: {counts.get('daily_meals_tracking', 0)} ورقة\n"
-            f"  • وصولات الدخول: {counts.get('entry_vouchers', 0)} وصل ({counts.get('entry_voucher_items', 0)} مادة)\n"
-            f"  • وصولات الخروج: {counts.get('exit_vouchers', 0)} وصل ({counts.get('exit_voucher_items', 0)} مادة)\n"
-            f"  • حركات المخزون التفصيلية: {counts.get('stock_movements', 0)} حركة\n"
-            f"  • أرصدة ومخصصات المواد: {counts.get('residence_articles', 0)} مادة\n"
+            f"📊 تفاصيل السجلات المسترجعة:\n"
+            f"  • أوراق الاستهلاك اليومي (خروج مطبخ): {counts.get('exit_vouchers', 0)} ورقة ({counts.get('exit_voucher_items', 0)} مادة مستهلكة)\n"
+            f"  • بطاقات تعداد التذاكر والوجبات: {counts.get('daily_meals_tracking', 0)} يوم مسجل\n"
+            f"  • وصولات الاستلام والتوريد (دخول): {counts.get('entry_vouchers', 0)} وصل ({counts.get('entry_voucher_items', 0)} مادة)\n"
+            f"  • حركات المخزون الإجمالية: {counts.get('stock_movements', 0)} حركة\n"
+            f"  • المواد المعتمدة للإقامة: {counts.get('residence_articles', counts.get('articles', 0))} مادة\n"
             f"  • الإعارات والاستعارات: {counts.get('residence_loans', 0)} إعارة\n"
-            f"  • محاضر الجرد: {counts.get('inventory_snapshots', 0)} محضر\n"
-            f"  • حصص الممونين: {counts.get('supplier_allocations', 0)} حصة\n\n"
-            f"🔒 تم تحويل الواجهة فوراً للإقامة المسترجعة مع عزل تام 100% لباقي الإقامات."
+            f"  • محاضر الجرد: {counts.get('inventory_snapshots', 0)} محضر\n\n"
+            f"👉 تم الانتقال التلقائي إلى ورقة الاستهلاك اليومي وتعداد التذاكر لآخر تاريخ مسجل للإقامة.\n"
+            f"🔒 تم عزل وتطبيق بيانات {r_name} حصراً دون المساس بأي إقامة أخرى نهائياً."
         )
 
         QMessageBox.information(self, "نجاح سحب البيانات من المديرية", details)

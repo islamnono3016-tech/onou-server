@@ -648,10 +648,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "exit_page"):
             self.exit_page.set_residence(r_id)
         if hasattr(self, "daily_sheet_page"):
-            self.daily_sheet_page.stock_svc.set_residence(r_id)
-            self.daily_sheet_page.meals_svc.set_residence(r_id)
-            self.daily_sheet_page.report_gen.set_residence(r_id, r_name)
-            self.daily_sheet_page.load_daily_sheet()
+            self.daily_sheet_page.set_residence(r_id, r_name)
         if hasattr(self, "settings_page") and hasattr(self.settings_page, "set_residence"):
             self.settings_page.set_residence(r_id, r_name)
 
@@ -1032,6 +1029,22 @@ class MainWindow(QMainWindow):
 
         # تبديل الإقامة النشطة فورياً للإقامة المسحوبة حتى تظهر كافة سجلاتها ومخزونها أمام المستخدم مباشرة
         self.set_active_residence(r_id, r_name)
+
+        # الانتقال التلقائي لأحدث تاريخ مسجل به بيانات استهلاك وتذاكر
+        latest = self.stock_svc.get_latest_active_date(r_id)
+        if latest:
+            qd = QDate.fromString(latest, "yyyy-MM-dd")
+            if hasattr(self, "daily_sheet_page"):
+                self.daily_sheet_page.set_date(qd)
+            if hasattr(self, "general_info_page"):
+                self.general_info_page.set_date(qd)
+
+        # التبديل فورياً إلى صفحة ورقة الاستهلاك اليومي ليرى المستخدم أوراقه وتذاكره مباشرة
+        is_admin = self.is_directorate_session()
+        daily_idx = 1 + (1 if is_admin else 0)
+        self.switch_page(daily_idx)
+        self._restore_nav_button(daily_idx)
+
         self.refresh_current_page_data()
 
     def update_sync_ui(self, is_online: bool):

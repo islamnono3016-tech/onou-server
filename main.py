@@ -3,14 +3,6 @@ import os
 
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
-    # Live Patching: Prioritize updated local python files
-    try:
-        from importlib.machinery import PathFinder
-        if PathFinder in sys.meta_path:
-            sys.meta_path.remove(PathFinder)
-            sys.meta_path.insert(0, PathFinder)
-    except Exception:
-        pass
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
