@@ -2,6 +2,10 @@ import datetime
 import logging
 from typing import Optional, List, Dict, Any, Tuple
 from database.db_manager import DatabaseManager
+try:
+    from core.time_service import TimeService
+except Exception:
+    TimeService = None
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +30,33 @@ class DateLockService:
 
     ALLOWED_WINDOW_DAYS = 3  # آخر 3 أيام تقويمية (اليوم الحالي + يومين سابقين)
 
+    # -------------------------------------------------------------------------
+    # مفتاح خاصية قفل الأيام: معطلة حالياً بناءً على طلب المستخدم
+    # (كافة الأيام في جميع الإقامات مفتوحة ومتاحة للتعديل والإدخال بدون قيود)
+    # لإعادة تفعيلها لاحقاً: يكفي إعادة LOCKING_FEATURE_ENABLED إلى True
+    # -------------------------------------------------------------------------
+    LOCKING_FEATURE_ENABLED = False
+
     def __init__(self, db_manager: Optional[DatabaseManager] = None):
         self.db = db_manager or DatabaseManager()
+
+    @classmethod
+    def is_feature_enabled(cls, db: Optional[DatabaseManager] = None) -> bool:
+        """
+        التحقق هل خاصية قفل الأيام مفعلة أم معطلة.
+        معطلة حالياً بطلب المستخدم لفتح جميع الأيام لكافة الإقامات.
+        """
+        if not cls.LOCKING_FEATURE_ENABLED:
+            return False
+        try:
+            db_mgr = db or DatabaseManager()
+            with db_mgr.get_connection() as conn:
+                row = conn.execute("SELECT value FROM settings WHERE key = 'date_locking_enabled'").fetchone()
+                if row and row["value"] == "0":
+                    return False
+        except Exception:
+            pass
+        return True
 
     def check_date_permission(
         self,
@@ -37,19 +66,31 @@ class DateLockService:
     ) -> Dict[str, Any]:
         """
         التحقق الشامل من صلاحية إدخال وتعديل البيانات ليوم محدد.
-        
-        المخرجات:
-        - is_editable: bool (هل يمكن التعديل والحفظ؟)
-        - reason_code: str (رمز الحالة)
-        - message: str (نص رسالة التوضيح والتنبيه للمستخدم)
-        - unlocked_info: dict / None (معلومات الترخيص إذا كان مفتوحاً من المديرية)
         """
+        # 0. إذا كانت الخاصية معطلة حالياً: كافة الأيام مفتوحة لجميع الإقامات بدون قيود
+        if not self.is_feature_enabled(self.db):
+            return {
+                "is_editable": True,
+                "reason_code": "ALL_DAYS_OPEN",
+                "message": "كافة الأيام مفتوحة ومتاحة للتعديل والإدخال (خاصية القفل معطلة حالياً)",
+                "unlocked_info": None
+            }
+
         # 1. إذا كان المستخدم من الإدارة المركزية / المديرية -> متاح دائماً
         if is_directorate:
             return {
                 "is_editable": True,
                 "reason_code": "DIRECTORATE_FULL_ACCESS",
                 "message": "صلاحية المديرية المركزية (إشراف ورقابة كاملة على كافة التواريخ)",
+                "unlocked_info": None
+            }
+
+        # يوم بداية السنة المحاسبية 01/09/2026 مفتوح دائماً لإدخال واعتماد مخزون أول مدة والمدخولات يدوياً
+        if target_date in ("2026-09-01", "01-09-2026"):
+            return {
+                "is_editable": True,
+                "reason_code": "INITIAL_STOCK_DATE_OPEN",
+                "message": "يوم 01/09/2026 مفتوح دائماً لتسجيل واعتماد مخزون أول مدة والمدخولات يدوياً.",
                 "unlocked_info": None
             }
 
@@ -63,7 +104,7 @@ class DateLockService:
                 "unlocked_info": None
             }
 
-        today = datetime.date.today()
+        today = TimeService.today() if TimeService else datetime.date.today()
         diff_days = (today - t_date).days
 
         # 2. فحص الأيام المستقبلية

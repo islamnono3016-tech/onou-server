@@ -1008,6 +1008,12 @@ class SyncWorker(QThread):
                         pending_cnt = self.sync_svc.get_pending_count(res_id)
                         if pending_cnt > 0 or self._trigger_now:
                             pushed, _ = self.sync_svc.push_pending(res_id)
+                            # عند حفظ ورقة اليوم أو طلب المزامنة الفورية للإقامة، رفع الحزمة الكاملة للإقامة لضمان تطابق مخزون أول مدة والسجلات فورياً
+                            if self._trigger_now and res_id:
+                                try:
+                                    self.sync_svc.push_full_residence_data(int(res_id))
+                                except Exception as e_pf:
+                                    logger.warning(f"SyncWorker: push_full_residence_data notice: {e_pf}")
 
                     if pushed > 0 or pulled > 0 or self._trigger_now:
                         left = self.sync_svc.get_pending_count(self.residence_id)

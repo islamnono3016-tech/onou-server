@@ -208,8 +208,8 @@ class DatabaseManager:
             self._migrate_unlocked_days(conn)
             # 2.4 تطبيق التقريب العلوي لمعدل الوجبات (78.5 -> 79, 120.5 -> 121)
             self._migrate_round_up_meals(conn)
-            # 2.5 نقل قيم توريد 01/09/2026 إلى عمود مخزون أول مدة فقط لجميع الإقامات
-            self._migrate_0901_supply_to_initial_stock(conn)
+            # 2.5 حذف وتطهير أي حركات أو وصولات مسجلة قبل تاريخ 01/09/2026
+            self._migrate_clean_pre_0901_records(conn)
             # 2.6 بذر وترحيل بيانات الإقامة الجامعية حساني محمد بن إبراهيم (RES-04)
             self._migrate_residence_4_data(conn)
 
@@ -564,55 +564,22 @@ class DatabaseManager:
             logger.error(f"Error in round-up meals migration: {e}")
 
     @staticmethod
-    def _migrate_0901_supply_to_initial_stock(conn: sqlite3.Connection):
+    def _migrate_clean_pre_0901_records(conn: sqlite3.Connection):
         """
-        نقل قيم التوريد المسجلة بتاريخ 01/09/2026 إلى عمود مخزون أول مدة فقط لجميع الإقامات،
-        وحذفها من التوريدات لتكون معتمدة كمخزون بداية السنة الدراسية / المالية.
+        حذف وتطهير أي حركات أو وصولات أو وجبات مسجلة قبل تاريخ 01/09/2026،
+        لتكون بداية التتبع المحاسبي المعتمد رسمياً لكافة الإقامات هي 01/09/2026.
         """
         try:
-            cur = conn.execute("""
-                SELECT ev.id, ev.voucher_number, ev.residence_id
-                FROM entry_vouchers ev
-                WHERE ev.date = '2026-09-01' AND ev.voucher_type = 'SUPPLIER'
-            """)
-            vouchers = cur.fetchall()
-            if not vouchers:
-                return
-
-            for v in vouchers:
-                v_id = v["id"]
-                r_id = v["residence_id"]
-                items = conn.execute("""
-                    SELECT evi.article_id, evi.quantity, evi.unit_price_ttc
-                    FROM entry_voucher_items evi
-                    WHERE evi.voucher_id = ?
-                """, (v_id,)).fetchall()
-
-                for it in items:
-                    art_id = it["article_id"]
-                    qty = float(it["quantity"] or 0.0)
-                    price = float(it["unit_price_ttc"] or 0.0)
-                    if qty <= 0:
-                        continue
-
-                    conn.execute("""
-                        INSERT INTO residence_articles (residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp)
-                        VALUES (?, ?, ?, ?, 10.0, ?)
-                        ON CONFLICT(residence_id, article_id) DO UPDATE SET
-                            initial_stock = initial_stock + excluded.initial_stock
-                    """, (r_id, art_id, qty, qty, price))
-
-                    if r_id == 1:
-                        conn.execute("UPDATE articles SET initial_stock = initial_stock + ? WHERE id = ?", (qty, art_id))
-
-                conn.execute("DELETE FROM entry_voucher_items WHERE voucher_id = ?", (v_id,))
-                conn.execute("DELETE FROM entry_vouchers WHERE id = ?", (v_id,))
-                conn.execute("DELETE FROM stock_movements WHERE voucher_id = ? AND movement_type = 'SUPPLY_IN' AND residence_id = ?", (v_id, r_id))
-
+            conn.execute("DELETE FROM entry_voucher_items WHERE voucher_id IN (SELECT id FROM entry_vouchers WHERE date < '2026-09-01')")
+            conn.execute("DELETE FROM entry_vouchers WHERE date < '2026-09-01'")
+            conn.execute("DELETE FROM exit_voucher_items WHERE voucher_id IN (SELECT id FROM exit_vouchers WHERE date < '2026-09-01')")
+            conn.execute("DELETE FROM exit_vouchers WHERE date < '2026-09-01'")
+            conn.execute("DELETE FROM stock_movements WHERE date < '2026-09-01'")
+            conn.execute("DELETE FROM daily_meals_tracking WHERE date < '2026-09-01'")
             conn.commit()
-            logger.info("Successfully migrated 01/09/2026 supply values to initial_stock for all residences.")
+            logger.info("Successfully cleaned all vouchers, movements and meals before 2026-09-01.")
         except Exception as e:
-            logger.error(f"Error in _migrate_0901_supply_to_initial_stock: {e}")
+            logger.error(f"Error in _migrate_clean_pre_0901_records: {e}")
 
     @staticmethod
     def _migrate_residence_4_data(conn: sqlite3.Connection):

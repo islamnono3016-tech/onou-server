@@ -910,10 +910,6 @@ class StockService:
                 initial_day_stock = init_base + prior_moves.get(art_id, 0.0)
 
                 sup_qty = supply_items.get(art_id, 0.0)
-                # حصر قيم توريد 01/09/2026 في عمود مخزون أول مدة فقط لجميع الإقامات
-                if date_str in ("2026-09-01", "01-09-2026") and sup_qty > 0:
-                    initial_day_stock += sup_qty
-                    sup_qty = 0.0
 
                 li_qty = loan_in_items.get(art_id, 0.0)
 
@@ -1216,23 +1212,21 @@ class StockService:
                         VALUES (?, ?, 'LOAN_OUT', ?, ?, 0, ?, ?, ?, 0)
                     """, (date_str, it["id"], lo_id, r_id, q, p, q * p))
 
-            # 3. معالجة التوريد (SUPPLY)
-            supply_items = [it for it in articles_input if it.get("supply_qty", 0) > 0]
+            # في يوم 01/09/2026 حصراً: حفظ وتثبيت مخزون أول مدة المسجل يدوياً في عمود (مخزون أول مدة)
             if date_str in ("2026-09-01", "01-09-2026"):
-                # في يوم 01/09/2026 حصراً: أي توريد يُحفظ مباشرة كمخزون أول مدة لجميع الإقامات
-                for it in supply_items:
-                    q = float(it.get("supply_qty", 0.0))
-                    p = float(it.get("price_ttc", 0.0))
-                    if q > 0:
-                        conn.execute("""
-                            INSERT INTO residence_articles (residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp)
-                            VALUES (?, ?, ?, ?, 10.0, ?)
-                            ON CONFLICT(residence_id, article_id) DO UPDATE SET
-                                initial_stock = initial_stock + excluded.initial_stock
-                        """, (r_id, it["id"], q, q, p))
-                        if r_id == 1:
-                            conn.execute("UPDATE articles SET initial_stock = initial_stock + ? WHERE id = ?", (q, it["id"]))
-                supply_items = []
+                for it in articles_input:
+                    init_q = float(it.get("initial_stock", 0.0) or 0.0)
+                    conn.execute("""
+                        INSERT INTO residence_articles (residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp)
+                        VALUES (?, ?, ?, ?, 10.0, ?)
+                        ON CONFLICT(residence_id, article_id) DO UPDATE SET
+                            initial_stock = excluded.initial_stock
+                    """, (r_id, it["id"], init_q, init_q, float(it.get("price_ttc", 0.0) or 0.0)))
+                    if r_id == 1:
+                        conn.execute("UPDATE articles SET initial_stock = ? WHERE id = ?", (init_q, it["id"]))
+
+            # 3. معالجة التوريد (SUPPLY) كحركة مدخولات معتمدة ومستقلة لجميع الأيام بما فيها 01/09/2026
+            supply_items = [it for it in articles_input if it.get("supply_qty", 0) > 0]
             old_sup = conn.execute("""
                 SELECT id FROM entry_vouchers
                 WHERE date = ? AND voucher_type = 'SUPPLIER' AND residence_id = ?
