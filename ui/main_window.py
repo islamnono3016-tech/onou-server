@@ -795,8 +795,12 @@ class MainWindow(QMainWindow):
         is_admin = self.is_directorate_session()
         offset = 1 if is_admin else 0
 
-        # إتاحة واجهة الإعدادات لكافة المستخدمين بما في ذلك مسؤولي الإقامات
-        # لتمكينهم من سحب واسترجاع بيانات إقامتهم في الأجهزة الجديدة دون قفل
+        # حماية واجهة النسخ الاحتياطي والإعدادات بكود المديرية الموحد
+        if index == (11 + offset):
+            from ui.widgets.directorate_auth_dialog import DirectorateAuthDialog
+            if not DirectorateAuthDialog.verify(self, "الدخول إلى واجهة النسخ الاحتياطي والإعدادات", self.db):
+                self._restore_nav_button(curr_idx)
+                return
 
         # 1. التبديل البصري الفوري بنقرة واحدة دون أي تجميد (0 ميلي ثانية)
         self.stack.setCurrentIndex(index)
@@ -1186,16 +1190,10 @@ class MainWindow(QMainWindow):
                 self.lbl_net_status.setStyleSheet("color: #94A3B8; font-weight: bold; font-size: 11px;")
 
     def open_network_settings(self):
-        is_admin = self.is_directorate_session()
-        if is_admin:
-            dlg = NetworkSettingsDialog(self.db, parent=self)
-            if dlg.exec():
-                is_online = self.sync_svc.is_server_reachable()
-                self.update_sync_ui(is_online)
-        else:
-            if NetworkSettingsDialog.open_with_admin_auth(self.db, parent=self):
-                is_online = self.sync_svc.is_server_reachable()
-                self.update_sync_ui(is_online)
+        from ui.widgets.network_settings_dialog import NetworkSettingsDialog
+        if NetworkSettingsDialog.open_with_admin_auth(self.db, parent=self):
+            is_online = self.sync_svc.is_server_reachable()
+            self.update_sync_ui(is_online)
 
     def open_update_dialog(self):
         """فتح نافذة التحديثات المستقلة وتثبيت الترقيات من فلاشة USB أو الشبكة"""
