@@ -587,11 +587,23 @@ class DatabaseManager:
     def _migrate_synchronize_meals_calculations(conn: sqlite3.Connection):
         """
         تصحيح ومزامنة كافة حسابات الإطعام وتكاليف الوجبات ومجموع المصاريف لجميع الإقامات:
-        1. مطابقة مصاريف الفطور والغداء والعشاء وإجمالي المصاريف مع وصولات خروج المطبخ المعتمدة KITCHEN.
-        2. ضمان المعادلة الحسابية الصارمة: م المصاريف = مصاريف الفطور + مصاريف الغداء + مصاريف العشاء.
-        3. حساب معدل الوجبات والتكلفة اليومية للطالب بدقة متناهية.
+        1. تفعيل كافة المواد الغذائية المستخدمة في الإطعام والفطور (مثل حليب غبرة 500غ كود 114).
+        2. مطابقة مصاريف الفطور والغداء والعشاء وإجمالي المصاريف مع وصولات خروج المطبخ المعتمدة KITCHEN.
+        3. ضمان المعادلة الحسابية الصارمة: م المصاريف = مصاريف الفطور + مصاريف الغداء + مصاريف العشاء.
+        4. حساب معدل الوجبات والتكلفة اليومية للطالب بدقة متناهية.
         """
         try:
+            # 0. تفعيل كافة المواد الغذائية المستهلكة في الإطعام والفطور أو التي تمتلك رصيد مخزون
+            conn.execute("""
+                UPDATE articles
+                SET is_active = 1
+                WHERE id = 114
+                   OR current_stock > 0
+                   OR EXISTS (SELECT 1 FROM exit_voucher_items WHERE article_id = articles.id)
+                   OR EXISTS (SELECT 1 FROM entry_voucher_items WHERE article_id = articles.id)
+                   OR EXISTS (SELECT 1 FROM residence_articles WHERE article_id = articles.id AND (current_stock > 0 OR initial_stock > 0));
+            """)
+
             # 1. تحديث مصاريف الوجبات ومجموع المصاريف من وصولات المطبخ KITCHEN الفعلية
             conn.execute("""
                 UPDATE daily_meals_tracking

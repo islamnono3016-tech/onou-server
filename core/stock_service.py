@@ -830,8 +830,21 @@ class StockService:
                        COALESCE(ra.initial_stock, a.initial_stock) as initial_stock
                 FROM articles a
                 LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
-                WHERE a.is_active = 1 ORDER BY a.id ASC
-            """, (r_id,)).fetchall()
+                WHERE (a.is_active = 1
+                   OR a.id IN (
+                       SELECT evi.article_id FROM exit_voucher_items evi
+                       JOIN exit_vouchers ev ON evi.voucher_id = ev.id
+                       WHERE ev.date = ? AND ev.residence_id = ?
+                   )
+                   OR a.id IN (
+                       SELECT eni.article_id FROM entry_voucher_items eni
+                       JOIN entry_vouchers ev ON eni.voucher_id = ev.id
+                       WHERE ev.date = ? AND ev.residence_id = ?
+                   )
+                   OR COALESCE(ra.current_stock, a.current_stock) > 0
+                )
+                ORDER BY a.id ASC
+            """, (r_id, date_str, r_id, date_str, r_id)).fetchall()
 
             # 2. الحركات المسجلة في هذا اليوم
             # خروج المطبخ (فطور، غداء، عشاء)
@@ -845,7 +858,8 @@ class StockService:
             for r in k_cur.fetchall():
                 kitchen_items[r["article_id"]] = {
                     "bf": r["qty_breakfast"], "lu": r["qty_lunch"],
-                    "di": r["qty_dinner"], "other": r["qty_other"]
+                    "di": r["qty_dinner"], "other": r["qty_other"],
+                    "unit_price_ttc": r["unit_price_ttc"]
                 }
 
             # إعارة خارجية (LOAN_OUT)
@@ -913,7 +927,7 @@ class StockService:
 
                 li_qty = loan_in_items.get(art_id, 0.0)
 
-                k_info = kitchen_items.get(art_id, {"bf": 0.0, "lu": 0.0, "di": 0.0, "other": 0.0})
+                k_info = kitchen_items.get(art_id, {"bf": 0.0, "lu": 0.0, "di": 0.0, "other": 0.0, "unit_price_ttc": None})
                 bf_qty = k_info["bf"]
                 lu_qty = k_info["lu"]
                 di_qty = k_info["di"]
@@ -921,9 +935,11 @@ class StockService:
 
                 final_day_stock = initial_day_stock + sup_qty + li_qty - (bf_qty + lu_qty + di_qty + lo_qty)
 
-                cost_bf = bf_qty * p_ttc
-                cost_lu = lu_qty * p_ttc
-                cost_di = di_qty * p_ttc
+                eff_price = k_info.get("unit_price_ttc") if (k_info.get("unit_price_ttc") and k_info.get("unit_price_ttc") > 0) else p_ttc
+
+                cost_bf = bf_qty * eff_price
+                cost_lu = lu_qty * eff_price
+                cost_di = di_qty * eff_price
 
                 tot_bf_expense += cost_bf
                 tot_lu_expense += cost_lu
@@ -934,7 +950,7 @@ class StockService:
                     "code": a["code"] or "",
                     "name": a["name"],
                     "unit": a["unit"],
-                    "price_ttc": p_ttc,
+                    "price_ttc": eff_price,
                     "initial_stock": initial_day_stock,
                     "supply_qty": sup_qty,
                     "loan_in_qty": li_qty,
@@ -975,7 +991,18 @@ class StockService:
             if "notes" not in meal_data or meal_data["notes"] is None:
                 meal_data["notes"] = ""
 
-            if grand_total_expense == 0 and meal_data.get("daily_food_expense", 0) > 0:
+            ev_row = conn.execute("""
+                SELECT total_breakfast_cost, total_lunch_cost, total_dinner_cost, total_amount
+                FROM exit_vouchers
+                WHERE date = ? AND voucher_type = 'KITCHEN' AND residence_id = ?
+            """, (date_str, r_id)).fetchone()
+            if ev_row and float(ev_row["total_amount"] or 0) > 0:
+                if grand_total_expense == 0:
+                    tot_bf_expense = float(ev_row["total_breakfast_cost"] or 0.0)
+                    tot_lu_expense = float(ev_row["total_lunch_cost"] or 0.0)
+                    tot_di_expense = float(ev_row["total_dinner_cost"] or 0.0)
+                    grand_total_expense = float(ev_row["total_amount"] or (tot_bf_expense + tot_lu_expense + tot_di_expense))
+            elif grand_total_expense == 0 and meal_data.get("daily_food_expense", 0) > 0:
                 tot_bf_expense = float(meal_data.get("bf_expense") or 0.0)
                 tot_lu_expense = float(meal_data.get("lu_expense") or 0.0)
                 tot_di_expense = float(meal_data.get("di_expense") or 0.0)
