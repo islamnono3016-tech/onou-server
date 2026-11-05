@@ -1291,8 +1291,12 @@ class StockService:
                 conn.executemany("UPDATE articles SET current_stock = ? WHERE id = ?", [(b[3], b[1]) for b in batch_updates])
 
             # 5. حفظ بيانات التذاكر والمعدلات وقائمة الطعام
-            exp_val = sum(it.get("bf_qty", 0) * it["price_ttc"] + it.get("lu_qty", 0) * it["price_ttc"] + it.get("di_qty", 0) * it["price_ttc"] for it in kitchen_items)
-            existing_meal = conn.execute("SELECT id, average_daily_meals FROM daily_meals_tracking WHERE date = ? AND residence_id = ?", (date_str, r_id)).fetchone()
+            tot_bf_exp = sum(it.get("bf_qty", 0) * it["price_ttc"] for it in kitchen_items)
+            tot_lu_exp = sum(it.get("lu_qty", 0) * it["price_ttc"] for it in kitchen_items)
+            tot_di_exp = sum(it.get("di_qty", 0) * it["price_ttc"] for it in kitchen_items)
+            exp_val = tot_bf_exp + tot_lu_exp + tot_di_exp
+
+            existing_meal = conn.execute("SELECT id, average_daily_meals, bf_total, lu_total, di_total FROM daily_meals_tracking WHERE date = ? AND residence_id = ?", (date_str, r_id)).fetchone()
 
             if tickets_input is not None:
                 bf_tot = tickets_input.get("bf_students", 0) + tickets_input.get("bf_staff", 0) + tickets_input.get("bf_professors", 0) + tickets_input.get("bf_guests", 0) + tickets_input.get("bf_free", 0)
@@ -1319,6 +1323,7 @@ class StockService:
                             lu_students = ?, lu_staff = ?, lu_professors = ?, lu_guests = ?, lu_free = ?, lu_total = ?,
                             di_students = ?, di_staff = ?, di_professors = ?, di_guests = ?, di_free = ?, di_total = ?,
                             average_daily_meals = ?, daily_food_expense = ?, student_daily_cost = ?,
+                            bf_expense = ?, lu_expense = ?, di_expense = ?,
                             menu_breakfast = ?, menu_lunch = ?, menu_dinner = ?,
                             notes = CASE WHEN ? IS NOT NULL THEN ? ELSE notes END
                         WHERE id = ?
@@ -1327,6 +1332,7 @@ class StockService:
                         tickets_input.get("lu_students", 0), tickets_input.get("lu_staff", 0), tickets_input.get("lu_professors", 0), tickets_input.get("lu_guests", 0), tickets_input.get("lu_free", 0), lu_tot,
                         tickets_input.get("di_students", 0), tickets_input.get("di_staff", 0), tickets_input.get("di_professors", 0), tickets_input.get("di_guests", 0), tickets_input.get("di_free", 0), di_tot,
                         avg_m, exp_val, cost_stud,
+                        tot_bf_exp, tot_lu_exp, tot_di_exp,
                         menu_in.get("menu_breakfast", ""), menu_in.get("menu_lunch", ""), menu_in.get("menu_dinner", ""),
                         notes, notes,
                         existing_meal["id"]
@@ -1339,37 +1345,49 @@ class StockService:
                             lu_students, lu_staff, lu_professors, lu_guests, lu_free, lu_total,
                             di_students, di_staff, di_professors, di_guests, di_free, di_total,
                             average_daily_meals, daily_food_expense, student_daily_cost,
+                            bf_expense, lu_expense, di_expense,
                             menu_breakfast, menu_lunch, menu_dinner, notes
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         date_str, r_id,
                         tickets_input.get("bf_students", 0), tickets_input.get("bf_staff", 0), tickets_input.get("bf_professors", 0), tickets_input.get("bf_guests", 0), tickets_input.get("bf_free", 0), bf_tot,
                         tickets_input.get("lu_students", 0), tickets_input.get("lu_staff", 0), tickets_input.get("lu_professors", 0), tickets_input.get("lu_guests", 0), tickets_input.get("lu_free", 0), lu_tot,
                         tickets_input.get("di_students", 0), tickets_input.get("di_staff", 0), tickets_input.get("di_professors", 0), tickets_input.get("di_guests", 0), tickets_input.get("di_free", 0), di_tot,
                         avg_m, exp_val, cost_stud,
+                        tot_bf_exp, tot_lu_exp, tot_di_exp,
                         menu_in.get("menu_breakfast", ""), menu_in.get("menu_lunch", ""), menu_in.get("menu_dinner", ""),
                         notes or ""
                     ))
             else:
                 # إذا كانت tickets_input فارغة أو None نحدث المصاريف فقط ونحافظ على التذاكر وقائمة الطعام السابقة
                 if existing_meal:
-                    avg_m = existing_meal["average_daily_meals"] or 0.0
-                    di_c = existing_meal["di_total"] if "di_total" in existing_meal.keys() else 1
-                    if di_c > 0 and avg_m > 0:
-                        cost_stud = (exp_val / avg_m / 2.0)
-                    elif avg_m > 0:
-                        cost_stud = exp_val / avg_m
+                    lu_cnt = existing_meal["lu_total"] or 0
+                    di_cnt = existing_meal["di_total"] or 0
+                    tot_lu_di = lu_cnt + di_cnt
+                    if di_cnt > 0 and tot_lu_di > 0:
+                        cost_stud = exp_val / float(tot_lu_di)
+                    elif lu_cnt > 0:
+                        cost_stud = exp_val / float(lu_cnt)
                     else:
                         cost_stud = 0.0
+
                     if notes is not None:
-                        conn.execute("UPDATE daily_meals_tracking SET daily_food_expense = ?, student_daily_cost = ?, notes = ? WHERE id = ?", (exp_val, cost_stud, notes, existing_meal["id"]))
+                        conn.execute("""
+                            UPDATE daily_meals_tracking 
+                            SET bf_expense = ?, lu_expense = ?, di_expense = ?, daily_food_expense = ?, student_daily_cost = ?, notes = ? 
+                            WHERE id = ?
+                        """, (tot_bf_exp, tot_lu_exp, tot_di_exp, exp_val, cost_stud, notes, existing_meal["id"]))
                     else:
-                        conn.execute("UPDATE daily_meals_tracking SET daily_food_expense = ?, student_daily_cost = ? WHERE id = ?", (exp_val, cost_stud, existing_meal["id"]))
+                        conn.execute("""
+                            UPDATE daily_meals_tracking 
+                            SET bf_expense = ?, lu_expense = ?, di_expense = ?, daily_food_expense = ?, student_daily_cost = ? 
+                            WHERE id = ?
+                        """, (tot_bf_exp, tot_lu_exp, tot_di_exp, exp_val, cost_stud, existing_meal["id"]))
                 else:
                     conn.execute("""
-                        INSERT INTO daily_meals_tracking (date, residence_id, daily_food_expense, student_daily_cost, notes)
-                        VALUES (?, ?, ?, 0.0, ?)
-                    """, (date_str, r_id, exp_val, notes or ""))
+                        INSERT INTO daily_meals_tracking (date, residence_id, bf_expense, lu_expense, di_expense, daily_food_expense, student_daily_cost, notes)
+                        VALUES (?, ?, ?, ?, ?, ?, 0.0, ?)
+                    """, (date_str, r_id, tot_bf_exp, tot_lu_exp, tot_di_exp, exp_val, notes or ""))
 
             conn.commit()
             try:
@@ -1400,25 +1418,34 @@ class StockService:
             else:
                 avg_m = float((lu_tot + di_tot) / 2.0)
 
-            if expenses_input:
+            # التحقق أولاً من وجود وصولات خروج مطبخ معتمدة KITCHEN لهذا اليوم
+            exp_row = conn.execute("""
+                SELECT COALESCE(SUM(total_amount), 0),
+                       COALESCE(SUM(total_breakfast_cost), 0),
+                       COALESCE(SUM(total_lunch_cost), 0),
+                       COALESCE(SUM(total_dinner_cost), 0)
+                FROM exit_vouchers
+                WHERE date = ? AND voucher_type = 'KITCHEN' AND residence_id = ?
+            """, (date_str, r_id)).fetchone()
+            v_tot = float(exp_row[0]) if exp_row else 0.0
+
+            if v_tot > 0:
+                exp_val = v_tot
+                bf_exp = float(exp_row[1])
+                lu_exp = float(exp_row[2])
+                di_exp = float(exp_row[3])
+            elif expenses_input:
                 bf_exp = float(expenses_input.get("bf_expense", 0.0))
                 lu_exp = float(expenses_input.get("lu_expense", 0.0))
                 di_exp = float(expenses_input.get("di_expense", 0.0))
                 exp_val = float(expenses_input.get("grand_total", bf_exp + lu_exp + di_exp))
+                if (bf_exp + lu_exp + di_exp) > 0 and abs(exp_val - (bf_exp + lu_exp + di_exp)) > 0.01:
+                    exp_val = bf_exp + lu_exp + di_exp
             else:
-                # جلب مصاريف اليوم المسجلة في وصولات المطبخ KITCHEN
-                exp_row = conn.execute("""
-                    SELECT COALESCE(SUM(total_amount), 0),
-                           COALESCE(SUM(total_breakfast_cost), 0),
-                           COALESCE(SUM(total_lunch_cost), 0),
-                           COALESCE(SUM(total_dinner_cost), 0)
-                    FROM exit_vouchers
-                    WHERE date = ? AND voucher_type = 'KITCHEN' AND residence_id = ?
-                """, (date_str, r_id)).fetchone()
-                exp_val = float(exp_row[0]) if exp_row else 0.0
-                bf_exp = float(exp_row[1]) if exp_row else 0.0
-                lu_exp = float(exp_row[2]) if exp_row else 0.0
-                di_exp = float(exp_row[3]) if exp_row else 0.0
+                exp_val = 0.0
+                bf_exp = 0.0
+                lu_exp = 0.0
+                di_exp = 0.0
 
             tot_lu_di = lu_tot + di_tot
             if di_tot > 0 and tot_lu_di > 0:

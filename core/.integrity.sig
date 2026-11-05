@@ -6,9 +6,9 @@
         "core\\auth_service.py": "2175e517c36f3bc7f84c960abea54931c15f03726db9db88b9f63e6da61d9376",
         "core\\update_service.py": "8f9228a09bce067c1da485f0a6c02d6412c23726a5307235f4ce1a85949eb36d",
         "core\\time_service.py": "736c0b47df730fd0d1a42fcc8e2bbcf0161fc433039c93f3781b3a5f12bf3d9e",
-        "database\\db_manager.py": "ed2d2737e79217aa0a94b58bdd5798ee86af4da5d5ef7f69993cdd64b0b93b27"
+        "database\\db_manager.py": "321970d3bfd7577780f6d2127b61270b13700f3aab1576e430107d3aafc905e8"
     },
-    "signature": "a5b39da8cfbe2b2cc801b7140e28dc5de56844da8a20ae51cfb76149c7aff078",
-    "timestamp": 1793823351,
+    "signature": "b788b712ea2ca38fdf772d4b56d1921be756cab251ab7162ddc2c631bfb432ee",
+    "timestamp": 1793899438,
     "version": "3.0"
 }

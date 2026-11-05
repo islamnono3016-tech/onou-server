@@ -1,3 +1,7 @@
+try:
+    from core.time_service import TimeService
+except Exception:
+    TimeService = None
 import os
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -766,7 +770,7 @@ class ReportGenerator:
             content = "\n".join(pages)
             title = f"أوراق الاستهلاك للفترة من {start_date} إلى {end_date}"
         else:
-            d_str = date_str or datetime.date.today().isoformat()
+            d_str = date_str or (TimeService.today_str() if TimeService else datetime.date.today().isoformat())
             content = self._generate_single_daily_voucher_content(d_str, is_last=True)
             title = f"ورقة الاستهلاك اليومي - {d_str}"
 
@@ -809,7 +813,7 @@ class ReportGenerator:
                 dates.append(cur_d.isoformat())
                 cur_d += datetime.timedelta(days=1)
         else:
-            d_str = date_str or datetime.date.today().isoformat()
+            d_str = date_str or (TimeService.today_str() if TimeService else datetime.date.today().isoformat())
             dates = [d_str]
 
         header_font = Font(name="Segoe UI", size=10, bold=True)
@@ -2368,6 +2372,10 @@ class ReportGenerator:
                 bf_e = d["bf_expense"]
                 lu_e = d["lu_expense"]
                 di_e = d["di_expense"]
+
+                # ضمان المعادلة الحسابية الصارمة: م المصاريف = مصاريف الفطور + مصاريف الغداء + مصاريف العشاء
+                if (bf_e + lu_e + di_e) > 0:
+                    tot_e = bf_e + lu_e + di_e
 
                 tot_grand_exp += tot_e
                 tot_bf_exp += bf_e

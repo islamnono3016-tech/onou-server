@@ -210,6 +210,8 @@ class DatabaseManager:
             self._migrate_round_up_meals(conn)
             # 2.5 حذف وتطهير أي حركات أو وصولات مسجلة قبل تاريخ 01/09/2026
             self._migrate_clean_pre_0901_records(conn)
+            # 2.5.1 تصحيح ومزامنة مصاريف وحسابات الإطعام والتكلفة اليومية لكافة الإقامات
+            self._migrate_synchronize_meals_calculations(conn)
             # 2.6 بذر وترحيل بيانات الإقامة الجامعية حساني محمد بن إبراهيم (RES-04)
             self._migrate_residence_4_data(conn)
 
@@ -580,6 +582,86 @@ class DatabaseManager:
             logger.info("Successfully cleaned all vouchers, movements and meals before 2026-09-01.")
         except Exception as e:
             logger.error(f"Error in _migrate_clean_pre_0901_records: {e}")
+
+    @staticmethod
+    def _migrate_synchronize_meals_calculations(conn: sqlite3.Connection):
+        """
+        تصحيح ومزامنة كافة حسابات الإطعام وتكاليف الوجبات ومجموع المصاريف لجميع الإقامات:
+        1. مطابقة مصاريف الفطور والغداء والعشاء وإجمالي المصاريف مع وصولات خروج المطبخ المعتمدة KITCHEN.
+        2. ضمان المعادلة الحسابية الصارمة: م المصاريف = مصاريف الفطور + مصاريف الغداء + مصاريف العشاء.
+        3. حساب معدل الوجبات والتكلفة اليومية للطالب بدقة متناهية.
+        """
+        try:
+            # 1. تحديث مصاريف الوجبات ومجموع المصاريف من وصولات المطبخ KITCHEN الفعلية
+            conn.execute("""
+                UPDATE daily_meals_tracking
+                SET 
+                    bf_expense = (
+                        SELECT COALESCE(total_breakfast_cost, 0)
+                        FROM exit_vouchers 
+                        WHERE date = daily_meals_tracking.date 
+                          AND residence_id = daily_meals_tracking.residence_id 
+                          AND voucher_type = 'KITCHEN'
+                    ),
+                    lu_expense = (
+                        SELECT COALESCE(total_lunch_cost, 0)
+                        FROM exit_vouchers 
+                        WHERE date = daily_meals_tracking.date 
+                          AND residence_id = daily_meals_tracking.residence_id 
+                          AND voucher_type = 'KITCHEN'
+                    ),
+                    di_expense = (
+                        SELECT COALESCE(total_dinner_cost, 0)
+                        FROM exit_vouchers 
+                        WHERE date = daily_meals_tracking.date 
+                          AND residence_id = daily_meals_tracking.residence_id 
+                          AND voucher_type = 'KITCHEN'
+                    ),
+                    daily_food_expense = (
+                        SELECT COALESCE(total_amount, 0)
+                        FROM exit_vouchers 
+                        WHERE date = daily_meals_tracking.date 
+                          AND residence_id = daily_meals_tracking.residence_id 
+                          AND voucher_type = 'KITCHEN'
+                    )
+                WHERE EXISTS (
+                    SELECT 1 FROM exit_vouchers 
+                    WHERE date = daily_meals_tracking.date 
+                      AND residence_id = daily_meals_tracking.residence_id 
+                      AND voucher_type = 'KITCHEN'
+                );
+            """)
+
+            # 2. للحالات التي لا يوجد فيها وصل خروج مطبخ ولكن مسجل مصاريف للوجبات:
+            conn.execute("""
+                UPDATE daily_meals_tracking
+                SET daily_food_expense = COALESCE(bf_expense, 0) + COALESCE(lu_expense, 0) + COALESCE(di_expense, 0)
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM exit_vouchers 
+                    WHERE date = daily_meals_tracking.date 
+                      AND residence_id = daily_meals_tracking.residence_id 
+                      AND voucher_type = 'KITCHEN'
+                ) AND (COALESCE(bf_expense, 0) + COALESCE(lu_expense, 0) + COALESCE(di_expense, 0)) > 0;
+            """)
+
+            # 3. إعادة حساب معدل الوجبات والتكلفة اليومية للطالب بدقة كاملة
+            conn.execute("""
+                UPDATE daily_meals_tracking
+                SET 
+                    average_daily_meals = CASE 
+                        WHEN di_total = 0 THEN CAST(lu_total AS REAL)
+                        ELSE (CAST(lu_total AS REAL) + CAST(di_total AS REAL)) / 2.0
+                    END,
+                    student_daily_cost = CASE 
+                        WHEN di_total > 0 AND (lu_total + di_total) > 0 THEN daily_food_expense / CAST(lu_total + di_total AS REAL)
+                        WHEN lu_total > 0 THEN daily_food_expense / CAST(lu_total AS REAL)
+                        ELSE 0.0
+                    END;
+            """)
+            conn.commit()
+            logger.info("Successfully synchronized all meals calculations for all residences.")
+        except Exception as e:
+            logger.error(f"Error in _migrate_synchronize_meals_calculations: {e}")
 
     @staticmethod
     def _migrate_residence_4_data(conn: sqlite3.Connection):

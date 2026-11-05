@@ -1,3 +1,7 @@
+try:
+    from core.time_service import TimeService
+except Exception:
+    TimeService = None
 import sqlite3
 import datetime
 import math
@@ -75,16 +79,30 @@ class MealsService:
         else:
             avg_meals = float((lu_total + di_total) / 2.0)
 
-        # 3. جلب أو تحديث المصاريف اليومية
-        daily_expense = float(data.get("daily_food_expense", 0.0))
+        # 3. جلب أو تحديث المصاريف اليومية ومصاريف الوجبات
         r_id = data.get("residence_id") or self.residence_id
-        if daily_expense == 0.0:
-            with self.db.get_connection() as conn:
-                exp_cur = conn.execute("""
-                    SELECT COALESCE(SUM(total_amount), 0) FROM exit_vouchers 
-                    WHERE date = ? AND voucher_type = 'KITCHEN' AND residence_id = ?
-                """, (date_str, r_id))
-                daily_expense = float(exp_cur.fetchone()[0])
+        bf_expense = float(data.get("bf_expense", 0.0))
+        lu_expense = float(data.get("lu_expense", 0.0))
+        di_expense = float(data.get("di_expense", 0.0))
+        daily_expense = float(data.get("daily_food_expense", 0.0))
+
+        with self.db.get_connection() as conn:
+            exp_cur = conn.execute("""
+                SELECT 
+                    COALESCE(SUM(total_amount), 0),
+                    COALESCE(SUM(total_breakfast_cost), 0),
+                    COALESCE(SUM(total_lunch_cost), 0),
+                    COALESCE(SUM(total_dinner_cost), 0)
+                FROM exit_vouchers 
+                WHERE date = ? AND voucher_type = 'KITCHEN' AND residence_id = ?
+            """, (date_str, r_id)).fetchone()
+            if exp_cur and float(exp_cur[0]) > 0:
+                daily_expense = float(exp_cur[0])
+                bf_expense = float(exp_cur[1])
+                lu_expense = float(exp_cur[2])
+                di_expense = float(exp_cur[3])
+            elif (bf_expense + lu_expense + di_expense) > 0:
+                daily_expense = bf_expense + lu_expense + di_expense
 
         # 4. حساب تكلفة وجبة الطالب اليومية مطابق لـ FC09
         student_cost = 0.0
@@ -103,8 +121,9 @@ class MealsService:
                     bf_students, bf_staff, bf_professors, bf_guests, bf_free, bf_total,
                     lu_students, lu_staff, lu_professors, lu_guests, lu_free, lu_total,
                     di_students, di_staff, di_professors, di_guests, di_free, di_total,
-                    average_daily_meals, daily_food_expense, student_daily_cost, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    average_daily_meals, daily_food_expense, student_daily_cost,
+                    bf_expense, lu_expense, di_expense, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(residence_id, date) DO UPDATE SET
                     bf_students = excluded.bf_students,
                     bf_staff = excluded.bf_staff,
@@ -127,6 +146,9 @@ class MealsService:
                     average_daily_meals = excluded.average_daily_meals,
                     daily_food_expense = excluded.daily_food_expense,
                     student_daily_cost = excluded.student_daily_cost,
+                    bf_expense = excluded.bf_expense,
+                    lu_expense = excluded.lu_expense,
+                    di_expense = excluded.di_expense,
                     notes = excluded.notes,
                     residence_id = excluded.residence_id
             """, (
@@ -134,7 +156,8 @@ class MealsService:
                 bf_stud, bf_staf, bf_prof, bf_gues, bf_free, bf_total,
                 lu_stud, lu_staf, lu_prof, lu_gues, lu_free, lu_total,
                 di_stud, di_staf, di_prof, di_gues, di_free, di_total,
-                avg_meals, daily_expense, student_cost, data.get("notes", "")
+                avg_meals, daily_expense, student_cost,
+                bf_expense, lu_expense, di_expense, data.get("notes", "")
             ))
             conn.commit()
 
@@ -159,8 +182,8 @@ class MealsService:
             rep_year = int(year) if year else d_start.year
             rep_month = int(month) if month else d_start.month
         else:
-            rep_year = int(year or datetime.date.today().year)
-            rep_month = int(month or datetime.date.today().month)
+            rep_year = int(year or (TimeService.today().year if TimeService else datetime.date.today().year))
+            rep_month = int(month or (TimeService.today().month if TimeService else datetime.date.today().month))
             if rep_month in [1, 3, 5, 7, 8, 10, 12]: last_day = 31
             elif rep_month in [4, 6, 9, 11]: last_day = 30
             else: last_day = 29 if (rep_year % 4 == 0 and (rep_year % 100 != 0 or rep_year % 400 == 0)) else 28
@@ -201,7 +224,32 @@ class MealsService:
                 else:
                     avg_m = float((lu_c + di_c) / 2.0)
 
-                d_exp = row["daily_food_expense"] if (row and row["daily_food_expense"] > 0) else v_row["tot_exp"]
+                v_bf = float(v_row["bf_exp"]) if v_row else 0.0
+                v_lu = float(v_row["lu_exp"]) if v_row else 0.0
+                v_di = float(v_row["di_exp"]) if v_row else 0.0
+                v_tot = float(v_row["tot_exp"]) if v_row else 0.0
+
+                if v_tot > 0 or (v_bf + v_lu + v_di) > 0:
+                    bf_e = v_bf
+                    lu_e = v_lu
+                    di_e = v_di
+                    d_exp = v_tot if v_tot > 0 else (bf_e + lu_e + di_e)
+                elif row:
+                    bf_e = float(row["bf_expense"] or 0.0)
+                    lu_e = float(row["lu_expense"] or 0.0)
+                    di_e = float(row["di_expense"] or 0.0)
+                    row_tot = float(row["daily_food_expense"] or 0.0)
+                    d_exp = (bf_e + lu_e + di_e) if (bf_e + lu_e + di_e) > 0 else row_tot
+                else:
+                    bf_e = 0.0
+                    lu_e = 0.0
+                    di_e = 0.0
+                    d_exp = 0.0
+
+                # تأكيد التوافق التام للمعادلة: م المصاريف = مصاريف الفطور + مصاريف الغداء + مصاريف العشاء
+                if (bf_e + lu_e + di_e) > 0 and abs(d_exp - (bf_e + lu_e + di_e)) > 0.01:
+                    d_exp = bf_e + lu_e + di_e
+
                 tot_lu_di = lu_c + di_c
                 if di_c > 0 and tot_lu_di > 0:
                     s_cost = d_exp / float(tot_lu_di)
@@ -219,11 +267,11 @@ class MealsService:
                     "day": d_day,
                     "date": d_str,
                     "bf_count": bf_c,
-                    "bf_expense": v_row["bf_exp"],
+                    "bf_expense": bf_e,
                     "lu_count": lu_c,
-                    "lu_expense": v_row["lu_exp"],
+                    "lu_expense": lu_e,
                     "di_count": di_c,
-                    "di_expense": v_row["di_exp"],
+                    "di_expense": di_e,
                     "average_meals": avg_m,
                     "total_expense": d_exp,
                     "student_cost": s_cost
@@ -261,8 +309,8 @@ class MealsService:
             d_start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
             d_end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
         else:
-            rep_year = int(year or datetime.date.today().year)
-            rep_month = int(month or datetime.date.today().month)
+            rep_year = int(year or (TimeService.today().year if TimeService else datetime.date.today().year))
+            rep_month = int(month or (TimeService.today().month if TimeService else datetime.date.today().month))
             if rep_month in [1, 3, 5, 7, 8, 10, 12]: last_day = 31
             elif rep_month in [4, 6, 9, 11]: last_day = 30
             else: last_day = 29 if (rep_year % 4 == 0 and (rep_year % 100 != 0 or rep_year % 400 == 0)) else 28
