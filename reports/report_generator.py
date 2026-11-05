@@ -2043,8 +2043,17 @@ class ReportGenerator:
     # 7. قائمة الأسعار الرسمية (مطابقة لورقة الأسعار في Excel)
     # -------------------------------------------------------------
     def generate_price_list_html(self, residence_id: Optional[int] = None) -> str:
-        """توليد مطبوعة قائمة الأسعار الرسمية مطابقة تماماً لورقة الأسعار في Excel"""
+        """توليد مطبوعة قائمة الأسعار الرسمية مطابقة تماماً لورقة الأسعار في Excel مع عزل أسعار كل إقامة"""
+        r_id = residence_id or getattr(self, "residence_id", 1)
         res_name = self.get_residence_name_ar()
+        if r_id:
+            try:
+                with self.db.get_connection() as conn:
+                    r_row = conn.execute("SELECT name FROM residences WHERE id = ?", (r_id,)).fetchone()
+                    if r_row:
+                        res_name = r_row["name"]
+            except Exception:
+                pass
         dir_name = self.get_directorate_name_ar()
         onou_name = self.db.get_setting("onou_name", "الديوان الوطني للخدمات الجامعية")
         year = self.db.get_setting("academic_year", "2026")
@@ -2052,12 +2061,18 @@ class ReportGenerator:
 
         with self.db.get_connection() as conn:
             articles = conn.execute("""
-                SELECT code, name, unit, price_ht, discount_rate, discount_amount,
-                       price_after_discount, tva_rate, price_ttc
-                FROM articles
-                WHERE is_active = 1
-                ORDER BY id ASC
-            """).fetchall()
+                SELECT a.code, a.name, a.unit,
+                       COALESCE(ra.price_ht, a.price_ht) as price_ht,
+                       COALESCE(ra.discount_rate, a.discount_rate) as discount_rate,
+                       COALESCE(ra.discount_amount, a.discount_amount) as discount_amount,
+                       COALESCE(ra.price_after_discount, a.price_after_discount) as price_after_discount,
+                       COALESCE(ra.tva_rate, a.tva_rate) as tva_rate,
+                       COALESCE(ra.price_ttc, a.price_ttc) as price_ttc
+                FROM articles a
+                LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                WHERE a.is_active = 1
+                ORDER BY a.id ASC
+            """, (r_id,)).fetchall()
 
         rows_html = ""
         for it in articles:
@@ -2217,19 +2232,28 @@ class ReportGenerator:
         """
         return html
 
-    def export_price_list_to_excel(self, save_path: str) -> str:
-        """تصدير قائمة الأسعار إلى مصنف Excel مطابق تماماً لورقة الأسعار في المنظومة"""
+    def export_price_list_to_excel(self, save_path: str, residence_id: Optional[int] = None) -> str:
+        """تصدير قائمة الأسعار إلى مصنف Excel مطابق تماماً لورقة الأسعار في المنظومة مع عزل أسعار كل إقامة"""
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "الأسعار"
         ws.views.sheetView[0].rightToLeft = True
 
+        r_id = residence_id or getattr(self, "residence_id", 1)
         res_name = self.get_residence_name_ar()
+        if r_id:
+            try:
+                with self.db.get_connection() as conn:
+                    r_row = conn.execute("SELECT name FROM residences WHERE id = ?", (r_id,)).fetchone()
+                    if r_row:
+                        res_name = r_row["name"]
+            except Exception:
+                pass
 
         # الترويسة الرئيسية
         ws.merge_cells("A1:I1")
         cell_title = ws["A1"]
-        cell_title.value = "قائمة الأسعار"
+        cell_title.value = f"قائمة الأسعار - {res_name}"
         cell_title.font = Font(name="Segoe UI", size=18, bold=True)
         cell_title.alignment = Alignment(horizontal="center", vertical="center")
 
@@ -2263,12 +2287,18 @@ class ReportGenerator:
 
         with self.db.get_connection() as conn:
             articles = conn.execute("""
-                SELECT code, name, unit, price_ht, discount_rate, discount_amount,
-                       price_after_discount, tva_rate, price_ttc
-                FROM articles
-                WHERE is_active = 1
-                ORDER BY id ASC
-            """).fetchall()
+                SELECT a.code, a.name, a.unit,
+                       COALESCE(ra.price_ht, a.price_ht) as price_ht,
+                       COALESCE(ra.discount_rate, a.discount_rate) as discount_rate,
+                       COALESCE(ra.discount_amount, a.discount_amount) as discount_amount,
+                       COALESCE(ra.price_after_discount, a.price_after_discount) as price_after_discount,
+                       COALESCE(ra.tva_rate, a.tva_rate) as tva_rate,
+                       COALESCE(ra.price_ttc, a.price_ttc) as price_ttc
+                FROM articles a
+                LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                WHERE a.is_active = 1
+                ORDER BY a.id ASC
+            """, (r_id,)).fetchall()
 
         row_idx = 4
         for it in articles:

@@ -671,6 +671,8 @@ class MainWindow(QMainWindow):
             self.exit_page.set_residence(r_id)
         if hasattr(self, "daily_sheet_page"):
             self.daily_sheet_page.set_residence(r_id, r_name)
+        if hasattr(self, "articles_page") and hasattr(self.articles_page, "set_residence"):
+            self.articles_page.set_residence(r_id, r_name)
         if hasattr(self, "settings_page") and hasattr(self.settings_page, "set_residence"):
             self.settings_page.set_residence(r_id, r_name)
 

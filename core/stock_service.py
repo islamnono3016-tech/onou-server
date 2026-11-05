@@ -83,8 +83,12 @@ class StockService:
         with self.db.get_connection() as conn:
             cur = conn.execute("""
                 SELECT a.id, a.code, a.name, a.category_id, a.unit,
-                       a.price_ht, a.discount_rate, a.discount_amount, a.price_after_discount,
-                       a.tva_rate, a.price_ttc,
+                       COALESCE(ra.price_ht, a.price_ht) as price_ht,
+                       COALESCE(ra.discount_rate, a.discount_rate) as discount_rate,
+                       COALESCE(ra.discount_amount, a.discount_amount) as discount_amount,
+                       COALESCE(ra.price_after_discount, a.price_after_discount) as price_after_discount,
+                       COALESCE(ra.tva_rate, a.tva_rate) as tva_rate,
+                       COALESCE(ra.price_ttc, a.price_ttc) as price_ttc,
                        COALESCE(ra.current_pmp, a.current_pmp, a.price_ttc) as current_pmp,
                        COALESCE(ra.safety_stock, a.safety_stock) as safety_stock,
                        COALESCE(ra.initial_stock, a.initial_stock) as initial_stock,
@@ -98,8 +102,9 @@ class StockService:
             row = cur.fetchone()
             return dict(row) if row else None
 
-    def save_article(self, data: Dict[str, Any]) -> int:
-        """إضافة أو تعديل مادة مع حساب الأسعار تلقائياً"""
+    def save_article(self, data: Dict[str, Any], residence_id: Optional[int] = None, apply_to_all_residences: bool = False) -> int:
+        """إضافة أو تعديل مادة مع حساب وحفظ الأسعار الخاصة بالإقامة أو تعميمها بدقة وعزل تام"""
+        r_id = residence_id or data.get("residence_id") or self.residence_id
         price_ht = float(data.get("price_ht", 0.0))
         discount_rate = float(data.get("discount_rate", 0.0)) # مثلاً 0.05
         discount_amount = price_ht * discount_rate
@@ -110,20 +115,55 @@ class StockService:
         article_id = data.get("id")
         with self.db.get_connection() as conn:
             if article_id:
-                conn.execute("""
-                    UPDATE articles SET
-                        code = ?, name = ?, category_id = ?, unit = ?,
-                        price_ht = ?, discount_rate = ?, discount_amount = ?,
-                        price_after_discount = ?, tva_rate = ?, price_ttc = ?,
-                        safety_stock = ?, is_active = ?
-                    WHERE id = ?
-                """, (
-                    data.get("code", ""), data["name"], data.get("category_id"),
-                    data.get("unit", "كلغ"), price_ht, discount_rate, discount_amount,
-                    price_after_discount, tva_rate, price_ttc,
-                    float(data.get("safety_stock", 0.0)), int(data.get("is_active", 1)),
-                    article_id
-                ))
+                if apply_to_all_residences:
+                    conn.execute("""
+                        UPDATE articles SET
+                            code = ?, name = ?, category_id = ?, unit = ?,
+                            price_ht = ?, discount_rate = ?, discount_amount = ?,
+                            price_after_discount = ?, tva_rate = ?, price_ttc = ?,
+                            safety_stock = ?, is_active = ?
+                        WHERE id = ?
+                    """, (
+                        data.get("code", ""), data["name"], data.get("category_id"),
+                        data.get("unit", "كلغ"), price_ht, discount_rate, discount_amount,
+                        price_after_discount, tva_rate, price_ttc,
+                        float(data.get("safety_stock", 0.0)), int(data.get("is_active", 1)),
+                        article_id
+                    ))
+                    conn.execute("""
+                        UPDATE residence_articles SET
+                            price_ht = ?, discount_rate = ?, discount_amount = ?,
+                            price_after_discount = ?, tva_rate = ?, price_ttc = ?
+                        WHERE article_id = ?
+                    """, (price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc, article_id))
+                else:
+                    conn.execute("""
+                        UPDATE articles SET
+                            code = ?, name = ?, category_id = ?, unit = ?,
+                            safety_stock = ?, is_active = ?
+                        WHERE id = ?
+                    """, (
+                        data.get("code", ""), data["name"], data.get("category_id"),
+                        data.get("unit", "كلغ"),
+                        float(data.get("safety_stock", 0.0)), int(data.get("is_active", 1)),
+                        article_id
+                    ))
+                    conn.execute("""
+                        INSERT INTO residence_articles (
+                            residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp,
+                            price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc
+                        ) VALUES (?, ?, 0.0, 0.0, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(residence_id, article_id) DO UPDATE SET
+                            price_ht = excluded.price_ht,
+                            discount_rate = excluded.discount_rate,
+                            discount_amount = excluded.discount_amount,
+                            price_after_discount = excluded.price_after_discount,
+                            tva_rate = excluded.tva_rate,
+                            price_ttc = excluded.price_ttc
+                    """, (
+                        r_id, article_id, float(data.get("safety_stock", 0.0)), price_ttc,
+                        price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc
+                    ))
             else:
                 initial_stock = float(data.get("initial_stock", 0.0))
                 cur = conn.execute("""
@@ -141,22 +181,51 @@ class StockService:
                     initial_stock, initial_stock, int(data.get("is_active", 1))
                 ))
                 article_id = cur.lastrowid
+                conn.execute("""
+                    INSERT OR REPLACE INTO residence_articles (
+                        residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp,
+                        price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    r_id, article_id, initial_stock, initial_stock,
+                    float(data.get("safety_stock", 0.0)), price_ttc,
+                    price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc
+                ))
                 if initial_stock > 0:
                     conn.execute("""
                         INSERT INTO stock_movements (
-                            date, article_id, movement_type, voucher_id,
+                            residence_id, date, article_id, movement_type, voucher_id,
                             qty_in, qty_out, unit_price, total_value, balance_after
-                        ) VALUES (?, ?, 'INITIAL', NULL, ?, 0, ?, ?, ?)
+                        ) VALUES (?, ?, ?, 'INITIAL', NULL, ?, 0, ?, ?, ?)
                     """, (
+                        r_id,
                         (TimeService.today_str() if TimeService else datetime.date.today().isoformat()), article_id,
                         initial_stock, price_ttc, initial_stock * price_ttc, initial_stock
                     ))
             conn.commit()
             try:
                 from core.cache_service import CacheService
-                CacheService.invalidate_articles(r_id if "r_id" in locals() else getattr(self, "residence_id", 1))
+                if apply_to_all_residences:
+                    CacheService.invalidate_all()
+                else:
+                    CacheService.invalidate_articles(r_id)
             except Exception:
                 pass
+
+            # رفع التحديث إلى السحابة فوراً في خيط مستقل
+            try:
+                import threading
+                def _async_push_price():
+                    try:
+                        from core.sync_service import SyncService
+                        s_svc = SyncService(self.db)
+                        s_svc.push_full_residence_data(r_id)
+                    except Exception as ex_p:
+                        logger.warning(f"Async push after save_article failed: {ex_p}")
+                threading.Thread(target=_async_push_price, daemon=True).start()
+            except Exception:
+                pass
+
             return article_id
 
     # -------------------------------------------------------------
@@ -219,7 +288,7 @@ class StockService:
 
                 # تحديث رصيد المادة والتكلفة المتوسطة PMP للإقامة
                 art_cur = conn.execute("""
-                    SELECT a.name, a.price_ttc,
+                    SELECT a.name, COALESCE(ra.price_ttc, a.price_ttc) as price_ttc,
                            COALESCE(ra.current_stock, a.current_stock) as current_stock,
                            COALESCE(ra.current_pmp, a.current_pmp, a.price_ttc) as current_pmp
                     FROM articles a
@@ -352,7 +421,7 @@ class StockService:
             for it in items:
                 art_id = it["article_id"]
                 art_cur = conn.execute("""
-                    SELECT a.name, a.price_ttc,
+                    SELECT a.name, COALESCE(ra.price_ttc, a.price_ttc) as price_ttc,
                            COALESCE(ra.current_stock, a.current_stock) as current_stock,
                            COALESCE(ra.current_pmp, a.current_pmp, a.price_ttc) as current_pmp
                     FROM articles a
@@ -744,8 +813,12 @@ class StockService:
         with self.db.get_connection() as conn:
             cur = conn.execute("""
                 SELECT a.id, a.code, a.name, a.category_id, a.unit,
-                       a.price_ht, a.discount_rate, a.discount_amount, a.price_after_discount,
-                       a.tva_rate, a.price_ttc,
+                       COALESCE(ra.price_ht, a.price_ht) as price_ht,
+                       COALESCE(ra.discount_rate, a.discount_rate) as discount_rate,
+                       COALESCE(ra.discount_amount, a.discount_amount) as discount_amount,
+                       COALESCE(ra.price_after_discount, a.price_after_discount) as price_after_discount,
+                       COALESCE(ra.tva_rate, a.tva_rate) as tva_rate,
+                       COALESCE(ra.price_ttc, a.price_ttc) as price_ttc,
                        COALESCE(ra.current_pmp, a.current_pmp, a.price_ttc) as current_pmp,
                        COALESCE(ra.safety_stock, a.safety_stock, 0.0) as safety_stock,
                        COALESCE(ra.initial_stock, a.initial_stock, 0.0) as initial_stock,
@@ -774,7 +847,7 @@ class StockService:
 
             # 2. القيمة الإجمالية للمخزون للإقامة المحددة
             tot_val_row = conn.execute("""
-                SELECT SUM(COALESCE(ra.current_stock, a.current_stock, 0.0) * a.price_ttc)
+                SELECT SUM(COALESCE(ra.current_stock, a.current_stock, 0.0) * COALESCE(ra.price_ttc, a.price_ttc))
                 FROM articles a
                 LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
                 WHERE a.is_active = 1
@@ -825,7 +898,7 @@ class StockService:
         with self.db.get_connection() as conn:
             # 1. قائمة كل المواد الخاصة بهذه الإقامة
             articles = conn.execute("""
-                SELECT a.id, a.code, a.name, a.unit, a.price_ttc,
+                SELECT a.id, a.code, a.name, a.unit, COALESCE(ra.price_ttc, a.price_ttc) as price_ttc,
                        COALESCE(ra.current_stock, a.current_stock) as current_stock,
                        COALESCE(ra.initial_stock, a.initial_stock) as initial_stock
                 FROM articles a

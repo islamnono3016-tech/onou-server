@@ -177,11 +177,12 @@ class DatabaseManager:
             # ???? ??? ?????? ?????? ??????? ???????? ????? (RES-04) ?????? ??? ?????? (0 ???? ????? ??? ???? ??????)
             self._migrate_residence_4_data(conn)
             self._fix_future_scrambled_records(conn)
+            self._migrate_residence_article_prices(conn)
 
-            # ?????? ?? ??? ????? ?????? ????? ???????? ???????? ??? ?? ????? (0 ???? ?????)
+            # التحقق من رقم إصدار بنية قاعدة البيانات لتفادي تكرار العمليات الثقيلة
             ver_cur = conn.execute("SELECT value FROM settings WHERE key='schema_version'")
             ver_row = ver_cur.fetchone()
-            if ver_row and ver_row["value"] == "2026.11.03.2":
+            if ver_row and ver_row["value"] == "2026.11.05.1":
                 return
 
             # 2. ترقية الأعمدة الناقصة لجميع الجداول بأمان (Safe Schema Migration)
@@ -325,7 +326,9 @@ class DatabaseManager:
                     UNIQUE(bon_id, product_num, col_index)
                 )
             """)
-            conn.execute("INSERT OR REPLACE INTO settings (key, value, description) VALUES ('schema_version', '2026.11.03.2', 'إصدار بنية قاعدة البيانات');")
+            # ترقية أسعار المواد الخاصة بكل إقامة
+            self._migrate_residence_article_prices(conn)
+            conn.execute("INSERT OR REPLACE INTO settings (key, value, description) VALUES ('schema_version', '2026.11.05.1', 'إصدار بنية قاعدة البيانات');")
             conn.commit()
         finally:
             conn.close()
@@ -748,6 +751,56 @@ class DatabaseManager:
             logger.info("Fixed future scrambled records for v3.5.2 successfully.")
         except Exception as e:
             logger.error(f"Error in _fix_future_scrambled_records: {e}")
+
+    @staticmethod
+    def _migrate_residence_article_prices(conn: sqlite3.Connection):
+        """إضافة أعمدة الأسعار الخاصة بكل إقامة إلى جدول residence_articles لتمكين تسعير مخصص لكل إقامة وعزل تام"""
+        try:
+            cur = conn.execute("PRAGMA table_info(residence_articles)")
+            existing_cols = {r[1] for r in cur.fetchall()}
+            
+            price_cols = [
+                ("price_ht", "REAL DEFAULT NULL"),
+                ("discount_rate", "REAL DEFAULT NULL"),
+                ("discount_amount", "REAL DEFAULT NULL"),
+                ("price_after_discount", "REAL DEFAULT NULL"),
+                ("tva_rate", "REAL DEFAULT NULL"),
+                ("price_ttc", "REAL DEFAULT NULL"),
+            ]
+            
+            for col_name, col_def in price_cols:
+                if col_name not in existing_cols:
+                    conn.execute(f"ALTER TABLE residence_articles ADD COLUMN {col_name} {col_def}")
+
+            # بذر/تعبئة الأسعار الافتراضية من جدول المواد articles إذا كانت فارغة
+            conn.execute("""
+                UPDATE residence_articles
+                SET 
+                    price_ht = COALESCE(price_ht, (SELECT price_ht FROM articles WHERE articles.id = residence_articles.article_id)),
+                    discount_rate = COALESCE(discount_rate, (SELECT discount_rate FROM articles WHERE articles.id = residence_articles.article_id)),
+                    discount_amount = COALESCE(discount_amount, (SELECT discount_amount FROM articles WHERE articles.id = residence_articles.article_id)),
+                    price_after_discount = COALESCE(price_after_discount, (SELECT price_after_discount FROM articles WHERE articles.id = residence_articles.article_id)),
+                    tva_rate = COALESCE(tva_rate, (SELECT tva_rate FROM articles WHERE articles.id = residence_articles.article_id)),
+                    price_ttc = COALESCE(price_ttc, (SELECT price_ttc FROM articles WHERE articles.id = residence_articles.article_id))
+                WHERE price_ttc IS NULL;
+            """)
+
+            # ضمان وجود سجل لكل مادة في كل إقامة
+            conn.execute("""
+                INSERT OR IGNORE INTO residence_articles (
+                    residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp,
+                    price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc
+                )
+                SELECT r.id, a.id, 0.0, 0.0, a.safety_stock, a.price_ttc,
+                       a.price_ht, a.discount_rate, a.discount_amount, a.price_after_discount, a.tva_rate, a.price_ttc
+                FROM residences r
+                CROSS JOIN articles a;
+            """)
+            conn.commit()
+            logger.info("Successfully verified residence_article prices schema and defaults.")
+        except Exception as e:
+            logger.error(f"Error in _migrate_residence_article_prices: {e}")
+
 
     def get_setting(self, key: str, default: str = "") -> str:
 

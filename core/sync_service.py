@@ -463,6 +463,86 @@ class SyncService:
             logger.exception("Error in pull_full_residence_data")
             return {"success": False, "error": f"تعذر سحب البيانات عبر الشبكة: {str(e)}"}
 
+    def pull_residence_prices(self, residence_id: Optional[int] = None, base_url: Optional[str] = None) -> Dict[str, Any]:
+        """
+        سحب وتحديث الأسعار المعتمدة لإقامة محددة أو كافة الإقامات من خادم المديرية/السحابة،
+        وحفظها فوراً في جدول residence_articles المحلي مع تحديث الذاكرة والكاش.
+        """
+        url = (base_url or AppConfig.get_server_url()).rstrip("/")
+        timeout = AppConfig.get("timeout_seconds", 35.0)
+        r_id = residence_id or getattr(self, "residence_id", 1)
+
+        # 1. محاولة استدعاء مسار الأسعار السريع
+        try:
+            endpoint = f"{url}/api/sync/residence_prices"
+            params = {"residence_id": r_id} if r_id else {}
+            logger.info(f"Connecting to fetch residence prices: {endpoint}")
+            r = http_get(endpoint, params=params, timeout=timeout)
+            if r.status_code == 200:
+                resp_json = r.json()
+                items = resp_json.get("residence_articles", [])
+                if items:
+                    with self.db.get_connection() as conn:
+                        for row in items:
+                            cols = [k for k in row.keys() if k in (
+                                "residence_id", "article_id", "price_ht", "discount_rate",
+                                "discount_amount", "price_after_discount", "tva_rate", "price_ttc"
+                            )]
+                            placeholders = ",".join("?" for _ in cols)
+                            update_cols = [c for c in cols if c not in ("residence_id", "article_id")]
+                            update_clause = ",".join(f"{c}=excluded.{c}" for c in update_cols)
+                            sql = f"""
+                                INSERT INTO residence_articles ({','.join(cols)}) VALUES ({placeholders})
+                                ON CONFLICT(residence_id, article_id) DO UPDATE SET {update_clause}
+                            """
+                            conn.execute(sql, tuple(row[c] for c in cols))
+                        conn.commit()
+
+                    from core.cache_service import CacheService
+                    if r_id:
+                        CacheService.invalidate_articles(r_id)
+                    else:
+                        CacheService.invalidate_all()
+
+                    logger.info(f"Successfully pulled {len(items)} updated residence prices.")
+                    return {"success": True, "count": len(items)}
+        except Exception as e:
+            logger.warning(f"Fast prices pull endpoint notice ({e}), trying full pull...")
+
+        # 2. خطة بديلة: استخدام residence_full_pull
+        try:
+            endpoint = f"{url}/api/sync/residence_full_pull?residence_id={r_id}"
+            r = http_get(endpoint, timeout=timeout)
+            if r.status_code == 200:
+                resp_json = r.json()
+                if resp_json.get("success"):
+                    pkg_data = resp_json.get("data", {})
+                    items = pkg_data.get("residence_articles", [])
+                    if items:
+                        with self.db.get_connection() as conn:
+                            for row in items:
+                                cols = [k for k in row.keys() if k in (
+                                    "residence_id", "article_id", "price_ht", "discount_rate",
+                                    "discount_amount", "price_after_discount", "tva_rate", "price_ttc"
+                                )]
+                                placeholders = ",".join("?" for _ in cols)
+                                update_cols = [c for c in cols if c not in ("residence_id", "article_id")]
+                                update_clause = ",".join(f"{c}=excluded.{c}" for c in update_cols)
+                                sql = f"""
+                                    INSERT INTO residence_articles ({','.join(cols)}) VALUES ({placeholders})
+                                    ON CONFLICT(residence_id, article_id) DO UPDATE SET {update_clause}
+                                """
+                                conn.execute(sql, tuple(row[c] for c in cols))
+                            conn.commit()
+
+                        from core.cache_service import CacheService
+                        CacheService.invalidate_articles(r_id)
+                        return {"success": True, "count": len(items)}
+        except Exception as e2:
+            logger.error(f"Fallback full pull failed: {e2}")
+
+        return {"success": False, "error": "تعذر الاتصال بالخادم لسحب الأسعار المحدثة"}
+
     def restore_residence_from_db_file(self, residence_id: int, db_path: str) -> Dict[str, Any]:
         """
         سحب واسترجاع بيانات إقامة محددة مباشرة من ملف قاعدة بيانات المديرية (مثال: من فلاش ديسك USB).

@@ -242,6 +242,12 @@ CREATE TABLE IF NOT EXISTS residence_articles (
     current_stock REAL NOT NULL DEFAULT 0.0,
     safety_stock REAL NOT NULL DEFAULT 0.0,
     current_pmp REAL NOT NULL DEFAULT 0.0,
+    price_ht REAL DEFAULT NULL,
+    discount_rate REAL DEFAULT NULL,
+    discount_amount REAL DEFAULT NULL,
+    price_after_discount REAL DEFAULT NULL,
+    tva_rate REAL DEFAULT NULL,
+    price_ttc REAL DEFAULT NULL,
     PRIMARY KEY(residence_id, article_id)
 );
 

@@ -238,7 +238,7 @@ class NetworkServer:
 
             def do_GET(self):
                 path = self.path.split("?")[0]
-                if path not in ("/api/status", "/api/updates/check", "/api/updates/download", "/api/sync/pull"):
+                if path not in ("/api/status", "/api/updates/check", "/api/updates/download", "/api/sync/pull", "/api/sync/residence_prices"):
                     if not self._check_rate_limit():
                         self._send_json(429, {"error": "Rate limit exceeded. Please slow down."})
                         return
@@ -579,6 +579,22 @@ class NetworkServer:
                     except Exception as e:
                         self._send_json(500, {"error": f"Full export failed: {e}"})
 
+                elif path == "/api/sync/residence_prices":
+                    # سحب وتصدير الأسعار الخاصة بإقامة محددة أو كافة الإقامات
+                    res_id_raw = query_params.get("residence_id")
+                    try:
+                        with db.get_connection() as conn:
+                            if res_id_raw:
+                                r_id = int(res_id_raw)
+                                cur = conn.execute("SELECT * FROM residence_articles WHERE residence_id = ?", (r_id,))
+                            else:
+                                cur = conn.execute("SELECT * FROM residence_articles")
+                            cols = [c[0] for c in cur.description] if cur.description else []
+                            prices = [dict(zip(cols, r)) for r in cur.fetchall()]
+                            self._send_json(200, {"success": True, "residence_articles": prices})
+                    except Exception as ex_p:
+                        self._send_json(500, {"success": False, "error": str(ex_p)})
+
                 elif path == "/api/sync/residence_full_pull":
                     # سحب وتصدير كافة بيانات إقامة معينة للمزامنة والاسترجاع الشامل
                     res_id_raw = query_params.get("residence_id")
@@ -742,7 +758,7 @@ class NetworkServer:
                 try:
                     path = self.path.split("?")[0]
                     # استثناء مزامنة بيانات الإقامات وتسجيل الدخول من التقييد
-                    if path not in ("/api/sync/push", "/api/auth/login", "/api/sync/residence_full_push"):
+                    if path not in ("/api/sync/push", "/api/auth/login", "/api/sync/residence_full_push", "/api/sync/residence_prices"):
                         if not self._check_rate_limit():
                             self._send_json(429, {"error": "Rate limit exceeded. Please slow down."})
                             return
@@ -886,6 +902,29 @@ class NetworkServer:
                             "synced_ids": synced_ids
                         })
 
+
+                    elif path == "/api/sync/residence_prices":
+                        # استقبال وتحديث الأسعار المخصصة للإقامة فوراً
+                        try:
+                            items = payload.get("residence_articles", [])
+                            with db.get_connection() as conn:
+                                for row in items:
+                                    cols = [k for k in row.keys() if k in (
+                                        "residence_id", "article_id", "price_ht", "discount_rate",
+                                        "discount_amount", "price_after_discount", "tva_rate", "price_ttc"
+                                    )]
+                                    placeholders = ",".join("?" for _ in cols)
+                                    update_cols = [c for c in cols if c not in ("residence_id", "article_id")]
+                                    update_clause = ",".join(f"{c}=excluded.{c}" for c in update_cols)
+                                    sql = f"""
+                                        INSERT INTO residence_articles ({','.join(cols)}) VALUES ({placeholders})
+                                        ON CONFLICT(residence_id, article_id) DO UPDATE SET {update_clause}
+                                    """
+                                    conn.execute(sql, tuple(row[c] for c in cols))
+                                conn.commit()
+                            self._send_json(200, {"success": True, "count": len(items)})
+                        except Exception as ex_pp:
+                            self._send_json(500, {"success": False, "error": str(ex_pp)})
 
                     elif path == "/api/sync/residence_full_push":
                         # استقبال الحزمة الكاملة لبيانات إقامة محددة وتحديثها بالكامل في السيرفر
