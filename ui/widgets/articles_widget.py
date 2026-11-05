@@ -213,6 +213,7 @@ class ArticlesWidget(QWidget):
     شاشة قائمة الأسعار ودليل المواد
     مطابقة تماماً لورقة 'الأسعار' في ملفات Excel مع الأعمدة الرسمية:
     (رقم الحصة | إسم المادة | الوحدة | سعر بدون رسوم | نسبة التخفيض | قيمة التخفيض | السعر بعد التخفيض | ض ق م / TVA | السعر بكامل الرسوم)
+    تتيح التعديل المباشر داخل الجدول مع زر حفظ التغييرات وعزل تام لأسعار كل إقامة.
     """
 
     article_saved = pyqtSignal()
@@ -223,6 +224,8 @@ class ArticlesWidget(QWidget):
         self.sync_svc = SyncService(self.stock_svc.db)
         self.current_residence_id = getattr(self.stock_svc, "residence_id", 1)
         self.current_residence_name = ""
+        self.modified_articles = {} # art_id -> dict of modified prices
+
         try:
             with self.stock_svc.db.get_connection() as conn:
                 r_row = conn.execute("SELECT name FROM residences WHERE id = ?", (self.current_residence_id,)).fetchone()
@@ -260,11 +263,11 @@ class ArticlesWidget(QWidget):
 
         lbl_excel_title = QLabel("قائمة الأسعار")
         lbl_excel_title.setProperty("class", "page-title")
-        lbl_excel_sub = QLabel("جدول الأسعار التعاقدية والتخفيضات والرسوم (مطابقة لورقة الأسعار في Excel)")
-        lbl_excel_sub.setStyleSheet("font-size: 11px; color: #94A3B8; margin-right: 15px;")
+        self.lbl_excel_sub = QLabel(f"جدول الأسعار التعاقدية والتخفيضات والرسوم - {self.current_residence_name}")
+        self.lbl_excel_sub.setStyleSheet("font-size: 11px; color: #38BDF8; margin-right: 15px; font-weight: bold;")
 
         tb_h_layout.addWidget(lbl_excel_title)
-        tb_h_layout.addWidget(lbl_excel_sub)
+        tb_h_layout.addWidget(self.lbl_excel_sub)
         tb_h_layout.addStretch()
 
         # أزرار الإجراءات في شريط العنوان
@@ -306,30 +309,19 @@ class ArticlesWidget(QWidget):
         self.cmb_category.currentIndexChanged.connect(self.load_articles)
         fb_layout.addWidget(self.cmb_category, stretch=2)
 
-        # محدد الإقامة المعنية لعرض وتعديل أسعارها الخاصة
-        lbl_res_tag = QLabel("الإقامة:")
-        lbl_res_tag.setStyleSheet("font-weight: bold; color: #38BDF8; margin-right: 5px;")
-        fb_layout.addWidget(lbl_res_tag)
-
-        self.cmb_residence_filter = QComboBox()
-        with self.stock_svc.db.get_connection() as conn:
-            r_list = conn.execute("SELECT id, name FROM residences WHERE is_active = 1 ORDER BY id").fetchall()
-            for r in r_list:
-                self.cmb_residence_filter.addItem(f"🏢 {r['name']}", r["id"])
-        
-        # تحديد الإقامة الحالية
-        for i in range(self.cmb_residence_filter.count()):
-            if self.cmb_residence_filter.itemData(i) == self.current_residence_id:
-                self.cmb_residence_filter.setCurrentIndex(i)
-                break
-        self.cmb_residence_filter.currentIndexChanged.connect(self.on_residence_filter_changed)
-        fb_layout.addWidget(self.cmb_residence_filter, stretch=2)
+        # زر حفظ التغييرات السعرية البارز
+        self.btn_save_changes = QPushButton("💾 حفظ التغييرات")
+        self.btn_save_changes.setProperty("class", "btn-primary")
+        self.btn_save_changes.setStyleSheet("background-color: #059669; color: white; font-weight: bold; font-size: 13px; padding: 6px 20px; border-radius: 6px;")
+        self.btn_save_changes.setToolTip("حفظ كافة تعديلات الأسعار في قاعدة البيانات وتحديث كافة الواجهات بالقيم الجديدة فوراً")
+        self.btn_save_changes.clicked.connect(self.save_all_price_changes)
+        fb_layout.addWidget(self.btn_save_changes)
 
         # زر سحب الأسعار المحدثة من السيرفر/المديرية
         self.btn_pull_prices = QPushButton("🔄 سحب الأسعار المحدثة")
         self.btn_pull_prices.setProperty("class", "btn-secondary")
         self.btn_pull_prices.setStyleSheet("font-weight: bold; background: rgba(14, 165, 233, 0.15); border: 1px solid #0284C7; color: #38BDF8;")
-        self.btn_pull_prices.setToolTip("سحب وتحديث الأسعار المحدثة من الخادم/المديرية لهذه الإقامة")
+        self.btn_pull_prices.setToolTip("سحب وتحديث الأسعار المعتمدة من الخادم/المديرية لإقامتك")
         self.btn_pull_prices.clicked.connect(self.pull_updated_prices)
         fb_layout.addWidget(self.btn_pull_prices)
 
@@ -347,11 +339,11 @@ class ArticlesWidget(QWidget):
             "رقم الحصة",
             "إسم المادة",
             "الوحدة",
-            "سعر بدون رسوم",
-            "نسبة التخفيض",
+            "سعر بدون رسوم ✏️",
+            "نسبة التخفيض ✏️",
             "قيمة التخفيض",
             "السعر بعد التخفيض",
-            "ض ق م / TVA",
+            "ض ق م / TVA ✏️",
             "السعر بكامل الرسوم"
         ])
 
@@ -362,16 +354,17 @@ class ArticlesWidget(QWidget):
 
         self.table_prices.setColumnWidth(0, 90)   # رقم الحصة
         self.table_prices.setColumnWidth(2, 65)   # الوحدة
-        self.table_prices.setColumnWidth(3, 115)  # سعر بدون رسوم
-        self.table_prices.setColumnWidth(4, 90)   # نسبة التخفيض
+        self.table_prices.setColumnWidth(3, 125)  # سعر بدون رسوم
+        self.table_prices.setColumnWidth(4, 100)  # نسبة التخفيض
         self.table_prices.setColumnWidth(5, 105)  # قيمة التخفيض
         self.table_prices.setColumnWidth(6, 120)  # السعر بعد التخفيض
-        self.table_prices.setColumnWidth(7, 90)   # ض ق م TVA
+        self.table_prices.setColumnWidth(7, 100)  # ض ق م TVA
         self.table_prices.setColumnWidth(8, 135)  # السعر بكامل الرسوم
 
         self.table_prices.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table_prices.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table_prices.doubleClicked.connect(self.open_edit_dialog)
+        self.table_prices.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked | QTableWidget.EditTrigger.SelectedClicked | QTableWidget.EditTrigger.EditKeyPressed)
+        self.table_prices.cellDoubleClicked.connect(self.on_table_cell_double_clicked)
+        self.table_prices.itemChanged.connect(self.on_price_cell_changed)
         self.table_prices.verticalHeader().setDefaultSectionSize(30)
         from ui.common_filters import attach_smooth_scroll
         attach_smooth_scroll(self.table_prices)
@@ -386,7 +379,7 @@ class ArticlesWidget(QWidget):
 
         # شريط التلميح والتحكم السفلي
         bottom_box = QHBoxLayout()
-        lbl_hint = QLabel("💡 تلميح: انقر نقراً مزدوجاً على أي مادة لتعديل سعرها، أو نسب التخفيض والرسم على القيمة المضافة (TVA).")
+        lbl_hint = QLabel("💡 تلميح: يمكنك تعديل (سعر بدون رسوم، نسبة التخفيض، ض ق م) مباشرة في خلايا الجدول ثم النقر على '💾 حفظ التغييرات'، أو النقر المزدوج على اسم المادة لفتح نافذة التعديل.")
         lbl_hint.setStyleSheet("color: #64748B; font-size: 11px;")
         bottom_box.addWidget(lbl_hint)
         bottom_box.addStretch()
@@ -434,24 +427,13 @@ class ArticlesWidget(QWidget):
         root_layout.addWidget(self.tabs)
 
     def set_residence(self, r_id: int, r_name: str):
-        """استقبال تغيير الإقامة النشطة من النافذة الرئيسية وضبط الفلتر"""
+        """استقبال تغيير الإقامة النشطة وضبط عرض أسعارها حصراً"""
         self.current_residence_id = r_id
         self.current_residence_name = r_name
-        if hasattr(self, "cmb_residence_filter"):
-            self.cmb_residence_filter.blockSignals(True)
-            for i in range(self.cmb_residence_filter.count()):
-                if self.cmb_residence_filter.itemData(i) == r_id:
-                    self.cmb_residence_filter.setCurrentIndex(i)
-                    break
-            self.cmb_residence_filter.blockSignals(False)
+        self.modified_articles.clear()
+        if hasattr(self, "lbl_excel_sub"):
+            self.lbl_excel_sub.setText(f"جدول الأسعار التعاقدية والتخفيضات والرسوم - {r_name}")
         self.load_articles()
-
-    def on_residence_filter_changed(self):
-        r_id = self.cmb_residence_filter.currentData()
-        if r_id:
-            self.current_residence_id = r_id
-            self.current_residence_name = self.cmb_residence_filter.currentText().replace("🏢 ", "")
-            self.load_articles()
 
     def load_articles(self):
         search = self.txt_search.text().strip()
@@ -466,65 +448,214 @@ class ArticlesWidget(QWidget):
         self.render_stock_page()
 
     def render_prices_page(self):
+        self.table_prices.blockSignals(True)
         start_idx, end_idx = self.pagination_prices.get_slice_range()
         page_items = self.all_articles[start_idx:end_idx]
 
         self.table_prices.setRowCount(len(page_items))
         for r, art in enumerate(page_items):
+            art_id = art["id"]
+            is_modified = art_id in self.modified_articles
+            mod_data = self.modified_articles.get(art_id, {})
+
+            p_ht = mod_data.get("price_ht", art["price_ht"])
+            disc_rate = mod_data.get("discount_rate", float(art.get("discount_rate") or 0.0))
+            disc_amt = mod_data.get("discount_amount", float(art.get("discount_amount") or (p_ht * disc_rate)))
+            p_after = mod_data.get("price_after_discount", float(art.get("price_after_discount") or (p_ht - disc_amt)))
+            tva_val = mod_data.get("tva_rate", float(art.get("tva_rate") or 0.0))
+            p_ttc = mod_data.get("price_ttc", art["price_ttc"])
+
             # 0. رقم الحصة
             c_code = QTableWidgetItem(str(art.get("code") or "-"))
             c_code.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            c_code.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.table_prices.setItem(r, 0, c_code)
 
             # 1. إسم المادة
             c_name = QTableWidgetItem(art["name"])
             c_name.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            c_name.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.table_prices.setItem(r, 1, c_name)
 
             # 2. الوحدة
             c_unit = QTableWidgetItem(art.get("unit") or "كلغ")
             c_unit.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            c_unit.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.table_prices.setItem(r, 2, c_unit)
 
-            # 3. سعر بدون رسوم
-            c_ht = QTableWidgetItem(f"{art['price_ht']:,.2f}")
+            # 3. سعر بدون رسوم (قابل للتعديل المباشر)
+            c_ht = QTableWidgetItem(f"{p_ht:,.2f}")
             c_ht.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            c_ht.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
+            c_ht.setData(Qt.ItemDataRole.UserRole, art_id)
             self.table_prices.setItem(r, 3, c_ht)
 
-            # 4. نسبة التخفيض
-            disc_rate = float(art.get("discount_rate") or 0.0)
+            # 4. نسبة التخفيض (قابلة للتعديل المباشر)
             c_dr = QTableWidgetItem(f"{int(disc_rate * 100)}%")
             c_dr.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            c_dr.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
             self.table_prices.setItem(r, 4, c_dr)
 
-            # 5. قيمة التخفيض
-            disc_amt = float(art.get("discount_amount") or (art["price_ht"] * disc_rate))
+            # 5. قيمة التخفيض (محسوبة تلقائياً)
             c_da = QTableWidgetItem(f"{disc_amt:,.2f}")
             c_da.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            c_da.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.table_prices.setItem(r, 5, c_da)
 
-            # 6. السعر بعد التخفيض
-            p_after = float(art.get("price_after_discount") or (art["price_ht"] - disc_amt))
+            # 6. السعر بعد التخفيض (محسوب تلقائياً)
             c_pa = QTableWidgetItem(f"{p_after:,.2f}")
             c_pa.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            c_pa.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.table_prices.setItem(r, 6, c_pa)
 
-            # 7. ض ق م / TVA
-            tva_val = float(art.get("tva_rate") or 0.0)
+            # 7. ض ق م / TVA (قابلة للتعديل المباشر)
             c_tva = QTableWidgetItem(f"{int(tva_val)}%")
             c_tva.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            c_tva.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
             self.table_prices.setItem(r, 7, c_tva)
 
-            # 8. السعر بكامل الرسوم (TTC)
+            # 8. السعر بكامل الرسوم (TTC - محسوب تلقائياً)
             is_dark = ThemeManager.is_dark_mode()
             ttc_color = QColor("#34D399") if is_dark else QColor("#059669")
-            c_ttc = QTableWidgetItem(f"{art['price_ttc']:,.2f}")
+            c_ttc = QTableWidgetItem(f"{p_ttc:,.2f}")
             c_ttc.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             c_ttc.setForeground(ttc_color)
             font = c_ttc.font()
             font.setBold(True)
             c_ttc.setFont(font)
+            c_ttc.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.table_prices.setItem(r, 8, c_ttc)
+
+            if is_modified:
+                for c in range(9):
+                    cell = self.table_prices.item(r, c)
+                    if cell:
+                        cell.setBackground(QColor(16, 185, 129, 45))
+
+        self.table_prices.blockSignals(False)
+
+    def on_table_cell_double_clicked(self, row: int, col: int):
+        """النقر المزدوج على اسم المادة أو الحصة يفتح نافذة التعديل الشامل"""
+        if col in (0, 1, 2):
+            self.open_edit_dialog()
+
+    def on_price_cell_changed(self, item: QTableWidgetItem):
+        """معالجة التعديل المباشر في خلايا الأسعار وإعادة الحساب فوراً"""
+        if not item:
+            return
+        col = item.column()
+        if col not in (3, 4, 7):
+            return
+
+        row = item.row()
+        c_ht_item = self.table_prices.item(row, 3)
+        if not c_ht_item:
+            return
+
+        art_id = c_ht_item.data(Qt.ItemDataRole.UserRole)
+        if not art_id:
+            return
+
+        # استخراج القيم المدخلة بأمان
+        try:
+            p_ht_str = self.table_prices.item(row, 3).text().replace(",", "").replace(" ", "").strip()
+            p_ht = max(0.0, float(p_ht_str)) if p_ht_str else 0.0
+        except ValueError:
+            p_ht = 0.0
+
+        try:
+            disc_str = self.table_prices.item(row, 4).text().replace("%", "").replace(" ", "").strip()
+            disc_val = max(0.0, float(disc_str)) if disc_str else 0.0
+            disc_rate = disc_val / 100.0 if disc_val > 1.0 else disc_val
+        except ValueError:
+            disc_rate = 0.0
+
+        try:
+            tva_str = self.table_prices.item(row, 7).text().replace("%", "").replace(" ", "").strip()
+            tva_val = max(0.0, float(tva_str)) if tva_str else 0.0
+        except ValueError:
+            tva_val = 0.0
+
+        disc_amt = p_ht * disc_rate
+        p_after = p_ht - disc_amt
+        p_ttc = p_after * (1.0 + (tva_val / 100.0))
+
+        self.table_prices.blockSignals(True)
+        # تحديث الخلايا المحسوبة
+        c_da = self.table_prices.item(row, 5)
+        if c_da:
+            c_da.setText(f"{disc_amt:,.2f}")
+        c_pa = self.table_prices.item(row, 6)
+        if c_pa:
+            c_pa.setText(f"{p_after:,.2f}")
+        c_ttc = self.table_prices.item(row, 8)
+        if c_ttc:
+            c_ttc.setText(f"{p_ttc:,.2f}")
+
+        # تظليل السطر المعدل
+        for c in range(self.table_prices.columnCount()):
+            cell = self.table_prices.item(row, c)
+            if cell:
+                cell.setBackground(QColor(16, 185, 129, 45))
+        self.table_prices.blockSignals(False)
+
+        # تسجيل التعديل
+        self.modified_articles[art_id] = {
+            "id": art_id,
+            "price_ht": p_ht,
+            "discount_rate": disc_rate,
+            "discount_amount": disc_amt,
+            "price_after_discount": p_after,
+            "tva_rate": tva_val,
+            "price_ttc": p_ttc
+        }
+
+        # تحديث نص زر الحفظ
+        n = len(self.modified_articles)
+        self.btn_save_changes.setText(f"💾 حفظ التغييرات ({n})")
+        self.btn_save_changes.setStyleSheet("background-color: #059669; color: white; font-weight: bold; font-size: 13px; padding: 6px 20px; border-radius: 6px; border: 2px solid #34D399;")
+
+    def save_all_price_changes(self):
+        """حفظ كافة التغييرات السعرية المدخلة وتحديث المنظومة بالقيم الجديدة"""
+        if not self.modified_articles:
+            QMessageBox.information(
+                self, "تنبيه",
+                "لم تقم بتعديل أي أسعار في الجدول بعد.\nيمكنك تعديل خانات (سعر بدون رسوم، نسبة التخفيض، ض ق م) مباشرة في الجدول ثم النقر على حفظ التغييرات."
+            )
+            return
+
+        r_id = self.current_residence_id
+        res_name = self.current_residence_name or f"الإقامة {r_id}"
+
+        reply = QMessageBox.question(
+            self, "تأكيد الحفظ",
+            f"هل تريد حفظ التعديلات السعرية لـ {len(self.modified_articles)} مادة لـ:\n{res_name}\n\nسيتم تحديث كافة الواجهات وورقة الاستهلاك بالقيم والأسعار الجديدة فوراً.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            for art_id, data in self.modified_articles.items():
+                self.stock_svc.save_article(data, residence_id=r_id, apply_to_all_residences=False, auto_recalculate=False)
+
+            # إعادة حساب وتحديث كافة تكاليف ورقة الاستهلاك ومصاريف الإطعام
+            self.stock_svc.recalculate_residence_costs_from_prices(r_id)
+
+            saved_count = len(self.modified_articles)
+            self.modified_articles.clear()
+            self.btn_save_changes.setText("💾 حفظ التغييرات")
+            self.btn_save_changes.setStyleSheet("background-color: #059669; color: white; font-weight: bold; font-size: 13px; padding: 6px 20px; border-radius: 6px;")
+
+            self.load_articles()
+            self.article_saved.emit()
+
+            QMessageBox.information(
+                self, "نجاح الحفظ",
+                f"تم بنجاح حفظ أسعار {saved_count} مادة لـ {res_name}!\nتم تحديث ورقة الاستهلاك والوصولات وكافة الواجهات بالقيم الجديدة."
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "خطأ في الحفظ", f"حدث خطأ أثناء حفظ الأسعار: {e}")
 
     def render_stock_page(self):
         start_idx, end_idx = self.pagination_stock.get_slice_range()
@@ -532,50 +663,63 @@ class ArticlesWidget(QWidget):
 
         self.table_stock.setRowCount(len(page_items))
         for r, art in enumerate(page_items):
-            self.table_stock.setItem(r, 0, QTableWidgetItem(str(art.get("code") or "-")))
-            self.table_stock.setItem(r, 1, QTableWidgetItem(art["name"]))
-            self.table_stock.setItem(r, 2, QTableWidgetItem(art.get("category_name") or "-"))
+            c_code = QTableWidgetItem(str(art.get("code") or "-"))
+            c_code.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table_stock.setItem(r, 0, c_code)
 
-            u_item = QTableWidgetItem(art.get("unit") or "كلغ")
-            u_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table_stock.setItem(r, 3, u_item)
+            c_name = QTableWidgetItem(art["name"])
+            c_name.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table_stock.setItem(r, 1, c_name)
 
-            ttc_item = QTableWidgetItem(f"{art['price_ttc']:,.2f} دج")
-            ttc_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.table_stock.setItem(r, 4, ttc_item)
+            c_cat = QTableWidgetItem(art.get("category_name") or "-")
+            c_cat.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table_stock.setItem(r, 2, c_cat)
 
-            stk_val = float(art.get("current_stock") or 0.0)
-            stk_item = QTableWidgetItem(f"{stk_val:g}")
-            stk_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            if stk_val <= 0:
-                stk_item.setForeground(Qt.GlobalColor.red)
-            self.table_stock.setItem(r, 5, stk_item)
+            c_unit = QTableWidgetItem(art.get("unit") or "كلغ")
+            c_unit.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table_stock.setItem(r, 3, c_unit)
 
-            safe_val = float(art.get("safety_stock") or 10.0)
-            safe_item = QTableWidgetItem(f"{safe_val:g}")
-            safe_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table_stock.setItem(r, 6, safe_item)
+            c_price = QTableWidgetItem(f"{art['price_ttc']:,.2f}")
+            c_price.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table_stock.setItem(r, 4, c_price)
 
-            init_item = QTableWidgetItem(f"{float(art.get('initial_stock') or 0.0):g}")
-            init_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table_stock.setItem(r, 7, init_item)
+            curr = art["current_stock"]
+            safe = art["safety_stock"]
 
-            # حالة المادة
-            is_dark = ThemeManager.is_dark_mode()
-            if stk_val <= 0:
-                status_txt = "نافد ❌"
-                status_color = QColor("#F87171") if is_dark else QColor("#DC2626")
-            elif stk_val <= safe_val:
-                status_txt = "قريب من النفاد ⚠️"
-                status_color = QColor("#FBBF24") if is_dark else QColor("#D97706")
+            c_cur = QTableWidgetItem(f"{curr:,.2f}")
+            c_cur.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if curr <= safe:
+                c_cur.setForeground(QColor("#EF4444"))
+                f = c_cur.font()
+                f.setBold(True)
+                c_cur.setFont(f)
+            self.table_stock.setItem(r, 5, c_cur)
+
+            c_safe = QTableWidgetItem(f"{safe:,.2f}")
+            c_safe.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table_stock.setItem(r, 6, c_safe)
+
+            c_init = QTableWidgetItem(f"{art['initial_stock']:,.2f}")
+            c_init.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table_stock.setItem(r, 7, c_init)
+
+            if curr <= 0:
+                status_txt = "نفد المخزون ❌"
+                status_col = QColor("#EF4444")
+            elif curr <= safe:
+                status_txt = "تنبيه أمان ⚠️"
+                status_col = QColor("#F59E0B")
             else:
-                status_txt = "متوفر بمستوى آمن ✔"
-                status_color = QColor("#34D399") if is_dark else QColor("#059669")
+                status_txt = "متوفر آمن ✔"
+                status_col = QColor("#10B981")
 
-            st_item = QTableWidgetItem(status_txt)
-            st_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            st_item.setForeground(status_color)
-            self.table_stock.setItem(r, 8, st_item)
+            c_st = QTableWidgetItem(status_txt)
+            c_st.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            c_st.setForeground(status_col)
+            font = c_st.font()
+            font.setBold(True)
+            c_st.setFont(font)
+            self.table_stock.setItem(r, 8, c_st)
 
     def refresh_theme(self):
         """إعادة رسم الجداول عند تبديل المظهر لضمان وضوح الألوان والتباين"""

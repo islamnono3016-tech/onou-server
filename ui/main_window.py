@@ -404,7 +404,7 @@ class MainWindow(QMainWindow):
         self.general_info_page.open_daily_sheet_requested.connect(self.on_switch_to_daily_sheet)
 
         self.articles_page = ArticlesWidget(self.stock_svc)
-        self.articles_page.article_saved.connect(self.mark_pages_dirty)
+        self.articles_page.article_saved.connect(self.on_articles_prices_saved)
         self.entry_page = EntryVoucherWidget(
             self.stock_svc,
             is_directorate=is_admin,
@@ -868,6 +868,22 @@ class MainWindow(QMainWindow):
             if hasattr(self, "settings_page"):
                 if hasattr(self.settings_page, "load_settings"):
                     self.settings_page.load_settings()
+
+    def on_articles_prices_saved(self):
+        """تحديث فوري وشامل لكافة الواجهات والبيانات عند تعديل الأسعار"""
+        self.mark_pages_dirty()
+        if hasattr(self, "daily_sheet_page"):
+            self.daily_sheet_page.load_daily_sheet()
+        if hasattr(self, "general_info_page"):
+            self.general_info_page.load_data()
+        if hasattr(self, "dashboard_page"):
+            self.dashboard_page.load_data()
+        if hasattr(self, "matrix_page"):
+            self.matrix_page.load_current_tab_data()
+        if hasattr(self, "trimester_page"):
+            self.trimester_page.load_situation()
+        if hasattr(self, "reports_page"):
+            self.reports_page.refresh_current_tab()
 
     def mark_pages_dirty(self):
         """عند حدوث تعديل في المخزون أو التذاكر، يتم تعليم الصفحات الأخرى لتحديثها عند زيارتها"""

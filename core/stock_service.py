@@ -102,7 +102,126 @@ class StockService:
             row = cur.fetchone()
             return dict(row) if row else None
 
-    def save_article(self, data: Dict[str, Any], residence_id: Optional[int] = None, apply_to_all_residences: bool = False) -> int:
+    def recalculate_residence_costs_from_prices(self, residence_id: Optional[int] = None):
+        """
+        إعادة حساب وتحديث كافة تكاليف ومصاريف ورقة الاستهلاك والوصولات والحركات
+        للإقامة المحددة استناداً إلى الأسعار الجديدة المعزولة بدقة متناهية
+        """
+        with self.db.get_connection() as conn:
+            target_ids = [residence_id] if residence_id else [r["id"] for r in conn.execute("SELECT id FROM residences").fetchall()]
+            for r_id in target_ids:
+                # 1. تحديث أسعار وتكاليف عناصر وصولات الإخراج (exit_voucher_items)
+                conn.execute("""
+                    UPDATE exit_voucher_items
+                    SET 
+                        unit_price_ttc = COALESCE(
+                            (SELECT COALESCE(ra.price_ttc, a.price_ttc) 
+                             FROM articles a 
+                             LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                             WHERE a.id = exit_voucher_items.article_id),
+                            unit_price_ttc
+                        ),
+                        total_cost = total_qty * COALESCE(
+                            (SELECT COALESCE(ra.price_ttc, a.price_ttc) 
+                             FROM articles a 
+                             LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                             WHERE a.id = exit_voucher_items.article_id),
+                            unit_price_ttc
+                        )
+                    WHERE voucher_id IN (SELECT id FROM exit_vouchers WHERE residence_id = ?)
+                """, (r_id, r_id, r_id))
+
+                # 2. تحديث مجاميع وصولات الإخراج (exit_vouchers)
+                conn.execute("""
+                    UPDATE exit_vouchers
+                    SET
+                        total_breakfast_cost = COALESCE((
+                            SELECT SUM(evi.qty_breakfast * evi.unit_price_ttc)
+                            FROM exit_voucher_items evi
+                            WHERE evi.voucher_id = exit_vouchers.id
+                        ), 0.0),
+                        total_lunch_cost = COALESCE((
+                            SELECT SUM(evi.qty_lunch * evi.unit_price_ttc)
+                            FROM exit_voucher_items evi
+                            WHERE evi.voucher_id = exit_vouchers.id
+                        ), 0.0),
+                        total_dinner_cost = COALESCE((
+                            SELECT SUM(evi.qty_dinner * evi.unit_price_ttc)
+                            FROM exit_voucher_items evi
+                            WHERE evi.voucher_id = exit_vouchers.id
+                        ), 0.0),
+                        total_amount = COALESCE((
+                            SELECT SUM(evi.total_cost)
+                            FROM exit_voucher_items evi
+                            WHERE evi.voucher_id = exit_vouchers.id
+                        ), 0.0)
+                    WHERE residence_id = ?
+                """, (r_id,))
+
+                # 3. تحديث مصاريف وتكاليف الوجبات اليومية (daily_meals_tracking)
+                conn.execute("""
+                    UPDATE daily_meals_tracking
+                    SET
+                        bf_expense = COALESCE((
+                            SELECT SUM(ev.total_breakfast_cost)
+                            FROM exit_vouchers ev
+                            WHERE ev.date = daily_meals_tracking.date AND ev.residence_id = daily_meals_tracking.residence_id AND ev.voucher_type = 'KITCHEN'
+                        ), bf_expense),
+                        lu_expense = COALESCE((
+                            SELECT SUM(ev.total_lunch_cost)
+                            FROM exit_vouchers ev
+                            WHERE ev.date = daily_meals_tracking.date AND ev.residence_id = daily_meals_tracking.residence_id AND ev.voucher_type = 'KITCHEN'
+                        ), lu_expense),
+                        di_expense = COALESCE((
+                            SELECT SUM(ev.total_dinner_cost)
+                            FROM exit_vouchers ev
+                            WHERE ev.date = daily_meals_tracking.date AND ev.residence_id = daily_meals_tracking.residence_id AND ev.voucher_type = 'KITCHEN'
+                        ), di_expense)
+                    WHERE residence_id = ?
+                """, (r_id,))
+
+                conn.execute("""
+                    UPDATE daily_meals_tracking
+                    SET
+                        daily_food_expense = bf_expense + lu_expense + di_expense,
+                        student_daily_cost = CASE 
+                            WHEN di_total > 0 AND (lu_total + di_total) > 0 THEN (bf_expense + lu_expense + di_expense) / CAST(lu_total + di_total AS REAL)
+                            WHEN lu_total > 0 THEN (bf_expense + lu_expense + di_expense) / CAST(lu_total AS REAL)
+                            ELSE 0.0
+                        END
+                    WHERE residence_id = ?
+                """, (r_id,))
+
+                # 4. تحديث حركات المخزون (stock_movements)
+                conn.execute("""
+                    UPDATE stock_movements
+                    SET
+                        unit_price = COALESCE(
+                            (SELECT COALESCE(ra.price_ttc, a.price_ttc) 
+                             FROM articles a 
+                             LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = stock_movements.residence_id
+                             WHERE a.id = stock_movements.article_id),
+                            unit_price
+                        ),
+                        total_value = (qty_in + qty_out) * COALESCE(
+                            (SELECT COALESCE(ra.price_ttc, a.price_ttc) 
+                             FROM articles a 
+                             LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = stock_movements.residence_id
+                             WHERE a.id = stock_movements.article_id),
+                            unit_price
+                        )
+                    WHERE residence_id = ? AND movement_type IN ('KITCHEN_OUT', 'LOAN_OUT', 'INITIAL')
+                """, (r_id,))
+
+            conn.commit()
+
+        try:
+            from core.cache_service import CacheService
+            CacheService.invalidate_all()
+        except Exception:
+            pass
+
+    def save_article(self, data: Dict[str, Any], residence_id: Optional[int] = None, apply_to_all_residences: bool = False, auto_recalculate: bool = True) -> int:
         """إضافة أو تعديل مادة مع حساب وحفظ الأسعار الخاصة بالإقامة أو تعميمها بدقة وعزل تام"""
         r_id = residence_id or data.get("residence_id") or self.residence_id
         price_ht = float(data.get("price_ht", 0.0))
@@ -211,6 +330,12 @@ class StockService:
                     CacheService.invalidate_articles(r_id)
             except Exception:
                 pass
+
+            if auto_recalculate:
+                try:
+                    self.recalculate_residence_costs_from_prices(r_id if not apply_to_all_residences else None)
+                except Exception as ex_rc:
+                    logger.warning(f"Notice recalculate_residence_costs_from_prices: {ex_rc}")
 
             # رفع التحديث إلى السحابة فوراً في خيط مستقل
             try:
