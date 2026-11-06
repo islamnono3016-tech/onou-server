@@ -283,6 +283,13 @@ class ArticlesWidget(QWidget):
         btn_export_excel.clicked.connect(self.export_price_list_excel)
         tb_h_layout.addWidget(btn_export_excel)
 
+        btn_import_excel = QPushButton("📥 استيراد من Excel")
+        btn_import_excel.setProperty("class", "btn-secondary")
+        btn_import_excel.setStyleSheet("font-weight: bold; background: rgba(16, 185, 129, 0.15); border: 1px solid #10B981; color: #34D399;")
+        btn_import_excel.setToolTip("استيراد الأسعار مباشرة من ملف Excel (مثل prix.xls) وتحديث الواجهات فوراً")
+        btn_import_excel.clicked.connect(self.import_price_list_excel)
+        tb_h_layout.addWidget(btn_import_excel)
+
         btn_add = QPushButton("+ إضافة مادة جديدة")
         btn_add.setProperty("class", "btn-primary")
         btn_add.clicked.connect(self.open_add_dialog)
@@ -888,6 +895,139 @@ class ArticlesWidget(QWidget):
         from core.print_helper import print_html_report
         html = self.report_gen.generate_price_list_html(residence_id=self.current_residence_id)
         print_html_report(self, html, is_landscape=False, job_title="دليل المواد والأسعار المعتمدة", direct_print=False)
+
+    def import_price_list_excel(self):
+        """استيراد وتطبيق الأسعار مباشرة من ملف Excel (مثل prix.xls) وتحديث الحسابات والواجهات فوراً"""
+        default_dir = r"C:\Users\pc\Desktop\الإقامات\العبيدي"
+        if not os.path.exists(default_dir):
+            default_dir = os.path.expanduser("~/Desktop")
+
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "اختر ملف Excel لقائمة الأسعار",
+            default_dir,
+            "ملفات إكسل (*.xls *.xlsx)"
+        )
+        if not filename:
+            return
+
+        try:
+            import xlrd
+            wb = xlrd.open_workbook(filename)
+            sheet_name = 'الأسعار' if 'الأسعار' in wb.sheet_names() else wb.sheet_names()[0]
+            sheet = wb.sheet_by_name(sheet_name)
+            is_xlrd = True
+        except Exception:
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(filename, data_only=True)
+                sheet_name = 'الأسعار' if 'الأسعار' in wb.sheetnames else wb.sheetnames[0]
+                sheet = wb[sheet_name]
+                is_xlrd = False
+            except Exception as ex_open:
+                QMessageBox.critical(self, "خطأ في قراءة الملف", f"تعذر فتح ملف Excel:\n{ex_open}")
+                return
+
+        r_id = self.current_residence_id
+        res_name = self.current_residence_name or f"الإقامة {r_id}"
+
+        reply = QMessageBox.question(
+            self, "تأكيد استيراد الأسعار",
+            f"هل تريد استيراد وتطبيق الأسعار من ورقة '{sheet_name}' لـ:\n🏢 {res_name}\n\nسيتم تحديث كافة الأسعار والواجهات والحسابات فوراً.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        updated_count = 0
+        try:
+            with self.stock_svc.db.get_connection() as conn:
+                total_rows = sheet.nrows if is_xlrd else sheet.max_row
+                for r in range(3, total_rows):
+                    if is_xlrd:
+                        name = str(sheet.cell_value(r, 1)).strip()
+                        if not name:
+                            continue
+                        def _get_val(c):
+                            try:
+                                return float(sheet.cell_value(r, c))
+                            except Exception:
+                                return 0.0
+                        p_ht = _get_val(3)
+                        disc_rate = _get_val(4)
+                        tva = _get_val(7)
+                        p_ttc = _get_val(8)
+                    else:
+                        row_cells = list(sheet.iter_rows(min_row=r+1, max_row=r+1, values_only=True))[0]
+                        name = str(row_cells[1] or "").strip()
+                        if not name:
+                            continue
+                        def _get_val_open(idx):
+                            try:
+                                return float(row_cells[idx]) if row_cells[idx] is not None else 0.0
+                            except Exception:
+                                return 0.0
+                        p_ht = _get_val_open(3)
+                        disc_rate = _get_val_open(4)
+                        tva = _get_val_open(7)
+                        p_ttc = _get_val_open(8)
+
+                    disc_amt = round(p_ht * disc_rate, 4)
+                    p_after = round(p_ht - disc_amt, 4)
+                    if p_ttc <= 0:
+                        p_ttc = round(p_after * (1.0 + tva), 4)
+
+                    art_id = r - 2
+                    cur_find = conn.execute("SELECT id FROM articles WHERE id = ? OR name = ?", (art_id, name)).fetchone()
+                    if cur_find:
+                        real_id = cur_find[0]
+                        conn.execute("""
+                            INSERT INTO residence_articles (
+                                residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp,
+                                price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc
+                            ) VALUES (?, ?, 0.0, 0.0, 10.0, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(residence_id, article_id) DO UPDATE SET
+                                price_ht = excluded.price_ht,
+                                discount_rate = excluded.discount_rate,
+                                discount_amount = excluded.discount_amount,
+                                price_after_discount = excluded.price_after_discount,
+                                tva_rate = excluded.tva_rate,
+                                price_ttc = excluded.price_ttc
+                        """, (r_id, real_id, p_ttc, p_ht, disc_rate, disc_amt, p_after, tva, p_ttc))
+
+                        conn.execute("""
+                            UPDATE articles SET
+                                price_ht = ?, discount_rate = ?, discount_amount = ?,
+                                price_after_discount = ?, tva_rate = ?, price_ttc = ?, current_pmp = ?
+                            WHERE id = ?
+                        """, (p_ht, disc_rate, disc_amt, p_after, tva, p_ttc, p_ttc, real_id))
+                        updated_count += 1
+                conn.commit()
+
+            self.stock_svc.recalculate_residence_costs_from_prices(r_id)
+            from core.cache_service import CacheService
+            CacheService.invalidate_all()
+
+            try:
+                import threading
+                def _sync_import(target_rid):
+                    try:
+                        self.sync_svc.push_residence_prices(target_rid)
+                        self.sync_svc.push_full_residence_data(target_rid)
+                    except Exception:
+                        pass
+                threading.Thread(target=_sync_import, args=(r_id,), daemon=True).start()
+            except Exception:
+                pass
+
+            self.load_articles()
+            self.article_saved.emit()
+
+            QMessageBox.information(
+                self, "نجاح الاستيراد",
+                f"تم بنجاح استيراد وتطبيق أسعار {updated_count} مادة لـ {res_name} من ملف Excel!\nتم تحديث ورقة الاستهلاك والوصولات والحسابات فوراً."
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "خطأ في الاستيراد", f"حدث خطأ أثناء استيراد الأسعار:\n{e}")
 
     def export_price_list_excel(self):
         res_suffix = f"_{self.current_residence_name}" if self.current_residence_name else ""
