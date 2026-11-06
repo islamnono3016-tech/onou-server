@@ -1118,7 +1118,8 @@ class StockService:
                        JOIN entry_vouchers ev ON eni.voucher_id = ev.id
                        WHERE ev.date = ? AND ev.residence_id = ?
                    )
-                   OR COALESCE(ra.current_stock, a.current_stock) > 0
+                   OR COALESCE(ra.current_stock, a.current_stock) != 0
+                   OR COALESCE(ra.initial_stock, a.initial_stock) > 0
                 )
                 ORDER BY a.id ASC
             """, (r_id, date_str, r_id, date_str, r_id)).fetchall()
@@ -1157,7 +1158,7 @@ class StockService:
                 SELECT evi.article_id, SUM(evi.quantity) as total_sup
                 FROM entry_voucher_items evi
                 JOIN entry_vouchers ev ON evi.voucher_id = ev.id
-                WHERE ev.date = ? AND ev.voucher_type = 'SUPPLIER' AND ev.residence_id = ?
+                WHERE ev.date = ? AND ev.voucher_type IN ('SUPPLIER', 'SUPPLY') AND ev.residence_id = ?
                 GROUP BY evi.article_id
             """, (date_str, r_id))
             for r in sup_cur.fetchall():
@@ -1533,7 +1534,7 @@ class StockService:
             supply_items = [it for it in articles_input if it.get("supply_qty", 0) > 0]
             old_sup = conn.execute("""
                 SELECT id FROM entry_vouchers
-                WHERE date = ? AND voucher_type = 'SUPPLIER' AND residence_id = ?
+                WHERE date = ? AND voucher_type IN ('SUPPLIER', 'SUPPLY') AND residence_id = ?
                   AND (delivery_note_ref = 'AUTO-DAILY'
                        OR voucher_number LIKE 'BE-%-SUP%'
                        OR voucher_number LIKE 'BE-SUPP-%'

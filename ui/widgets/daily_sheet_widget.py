@@ -2199,7 +2199,8 @@ class DailySheetWidget(QWidget):
 
         date_str = self.dt_picker.date().toString("yyyy-MM-dd")
 
-        data = self.stock_svc.get_daily_sheet_data(date_str)
+        r_id = getattr(self, 'current_residence_id', None) or self.stock_svc.residence_id
+        data = self.stock_svc.get_daily_sheet_data(date_str, residence_id=r_id)
 
 
 
@@ -2892,7 +2893,8 @@ class DailySheetWidget(QWidget):
 
             notes_val = self.txt_daily_notes.text().strip() if hasattr(self, "txt_daily_notes") and self.txt_daily_notes else ""
 
-            self.stock_svc.save_daily_sheet_full(date_str, self.articles_data, tickets_input=None, menu_input=None, notes=notes_val)
+            r_id = getattr(self, "current_residence_id", None) or self.stock_svc.residence_id
+            self.stock_svc.save_daily_sheet_full(date_str, self.articles_data, tickets_input=None, menu_input=None, residence_id=r_id, notes=notes_val)
 
             self.is_dirty = False
 
@@ -3284,6 +3286,8 @@ class DailySheetWidget(QWidget):
             self.dt_picker.setDate(qdate)
 
     def set_residence(self, r_id: int, r_name: str = ''):
+        self.current_residence_id = r_id
+        self.current_residence_name = r_name
         self.stock_svc.set_residence(r_id)
         self.meals_svc.set_residence(r_id)
         if hasattr(self, 'report_gen'):
