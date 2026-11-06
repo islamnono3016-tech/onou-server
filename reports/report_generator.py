@@ -177,7 +177,20 @@ class ReportGenerator:
                 WHERE ev.date = ? AND ev.voucher_type = 'KITCHEN' AND ev.residence_id = ?
                 ORDER BY a.id ASC
             """, (date_str, self.residence_id))
-            items = [dict(r) for r in cur.fetchall()]
+            raw_items = [dict(r) for r in cur.fetchall()]
+            items = []
+            for r in raw_items:
+                it = dict(r)
+                p_ttc = round(float(it.get("unit_price_ttc", 0.0) or 0.0), 2)
+                c_bf = round(float(it.get("qty_breakfast", 0.0) or 0.0) * p_ttc, 2)
+                c_lu = round(float(it.get("qty_lunch", 0.0) or 0.0) * p_ttc, 2)
+                c_di = round(float(it.get("qty_dinner", 0.0) or 0.0) * p_ttc, 2)
+                it["unit_price_ttc"] = p_ttc
+                it["cost_bf"] = c_bf
+                it["cost_lu"] = c_lu
+                it["cost_di"] = c_di
+                it["total_cost"] = round(c_bf + c_lu + c_di, 2)
+                items.append(it)
 
             # جلب إحصائيات التذاكر للإقامة المحددة حصراً
             meal_rec = self.meals_svc.get_daily_record(date_str, self.residence_id)
@@ -521,30 +534,43 @@ class ReportGenerator:
 
         logo_img_html = self.get_logo_img_html(36)
 
+        calc_tot_bf = 0.0
+        calc_tot_lu = 0.0
+        calc_tot_di = 0.0
         rows_html = ""
         for i, a in enumerate(articles, 1):
+            p_ttc = round(float(a.get("price_ttc", 0.0) or 0.0), 2)
+            c_bf = round(float(a.get("bf_qty", 0.0) or 0.0) * p_ttc, 2)
+            c_lu = round(float(a.get("lu_qty", 0.0) or 0.0) * p_ttc, 2)
+            c_di = round(float(a.get("di_qty", 0.0) or 0.0) * p_ttc, 2)
+            tot_exp = round(c_bf + c_lu + c_di, 2)
             tot_q = a["bf_qty"] + a["lu_qty"] + a["di_qty"]
+
+            calc_tot_bf = round(calc_tot_bf + c_bf, 2)
+            calc_tot_lu = round(calc_tot_lu + c_lu, 2)
+            calc_tot_di = round(calc_tot_di + c_di, 2)
+
             rows_html += f"""
             <tr>
-                <td style="border:1px solid #000000; text-align:right; font-weight:bold; padding:0px 2px;">{a['total_expense']:,.2f}</td>
+                <td style="border:1px solid #000000; text-align:right; font-weight:bold; padding:0px 2px;">{tot_exp:,.2f}</td>
                 <td style="border:1px solid #000000; text-align:center; font-weight:bold; padding:0px 2px;">{tot_q if tot_q > 0 else '-'}</td>
-                <td style="border:1px solid #000000; text-align:right; padding:0px 2px;">{a['cost_di']:,.2f}</td>
+                <td style="border:1px solid #000000; text-align:right; padding:0px 2px;">{c_di:,.2f}</td>
                 <td style="border:1px solid #000000; text-align:center; padding:0px 2px;">{a['di_qty'] if a['di_qty'] > 0 else '-'}</td>
-                <td style="border:1px solid #000000; text-align:right; padding:0px 2px;">{a['cost_lu']:,.2f}</td>
+                <td style="border:1px solid #000000; text-align:right; padding:0px 2px;">{c_lu:,.2f}</td>
                 <td style="border:1px solid #000000; text-align:center; padding:0px 2px;">{a['lu_qty'] if a['lu_qty'] > 0 else '-'}</td>
-                <td style="border:1px solid #000000; text-align:right; padding:0px 2px;">{a['cost_bf']:,.2f}</td>
+                <td style="border:1px solid #000000; text-align:right; padding:0px 2px;">{c_bf:,.2f}</td>
                 <td style="border:1px solid #000000; text-align:center; padding:0px 2px;">{a['bf_qty'] if a['bf_qty'] > 0 else '-'}</td>
-                <td style="border:1px solid #000000; text-align:right; padding:0px 2px;">{a['price_ttc']:,.2f}</td>
+                <td style="border:1px solid #000000; text-align:right; padding:0px 2px;">{p_ttc:,.2f}</td>
                 <td style="border:1px solid #000000; text-align:center; padding:0px 2px;">{a['unit']}</td>
                 <td style="border:1px solid #000000; font-weight:bold; text-align:right; padding:0px 3px;">{a['name']}</td>
                 <td style="border:1px solid #000000; text-align:center; padding:0px 2px;">{i:02d}</td>
             </tr>
             """
 
-        tot_bf = sheet_data["tot_bf_expense"]
-        tot_lu = sheet_data["tot_lu_expense"]
-        tot_di = sheet_data["tot_di_expense"]
-        grand_tot = sheet_data["grand_total_expense"]
+        tot_bf = calc_tot_bf
+        tot_lu = calc_tot_lu
+        tot_di = calc_tot_di
+        grand_tot = round(tot_bf + tot_lu + tot_di, 2)
 
         bf_cnt = meals.get("bf_total", 0)
         lu_cnt = meals.get("lu_total", 0)

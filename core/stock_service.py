@@ -110,48 +110,71 @@ class StockService:
         with self.db.get_connection() as conn:
             target_ids = [residence_id] if residence_id else [r["id"] for r in conn.execute("SELECT id FROM residences").fetchall()]
             for r_id in target_ids:
-                # 1. تحديث أسعار وتكاليف عناصر وصولات الإخراج (exit_voucher_items)
+                # 1. تحديث أسعار وتكاليف عناصر وصولات الإخراج (exit_voucher_items) بدقة سنتيمين
                 conn.execute("""
                     UPDATE exit_voucher_items
                     SET 
-                        unit_price_ttc = COALESCE(
+                        unit_price_ttc = ROUND(COALESCE(
                             (SELECT COALESCE(ra.price_ttc, a.price_ttc) 
                              FROM articles a 
                              LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
                              WHERE a.id = exit_voucher_items.article_id),
                             unit_price_ttc
-                        ),
-                        total_cost = total_qty * COALESCE(
-                            (SELECT COALESCE(ra.price_ttc, a.price_ttc) 
-                             FROM articles a 
-                             LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
-                             WHERE a.id = exit_voucher_items.article_id),
-                            unit_price_ttc
-                        )
+                        ), 2),
+                        total_cost = ROUND(
+                            ROUND(qty_breakfast * ROUND(COALESCE(
+                                (SELECT COALESCE(ra.price_ttc, a.price_ttc) 
+                                 FROM articles a 
+                                 LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                                 WHERE a.id = exit_voucher_items.article_id),
+                                unit_price_ttc
+                            ), 2), 2) +
+                            ROUND(qty_lunch * ROUND(COALESCE(
+                                (SELECT COALESCE(ra.price_ttc, a.price_ttc) 
+                                 FROM articles a 
+                                 LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                                 WHERE a.id = exit_voucher_items.article_id),
+                                unit_price_ttc
+                            ), 2), 2) +
+                            ROUND(qty_dinner * ROUND(COALESCE(
+                                (SELECT COALESCE(ra.price_ttc, a.price_ttc) 
+                                 FROM articles a 
+                                 LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                                 WHERE a.id = exit_voucher_items.article_id),
+                                unit_price_ttc
+                            ), 2), 2) +
+                            ROUND(qty_other * ROUND(COALESCE(
+                                (SELECT COALESCE(ra.price_ttc, a.price_ttc) 
+                                 FROM articles a 
+                                 LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                                 WHERE a.id = exit_voucher_items.article_id),
+                                unit_price_ttc
+                            ), 2), 2)
+                        , 2)
                     WHERE voucher_id IN (SELECT id FROM exit_vouchers WHERE residence_id = ?)
-                """, (r_id, r_id, r_id))
+                """, (r_id, r_id, r_id, r_id, r_id, r_id))
 
                 # 2. تحديث مجاميع وصولات الإخراج (exit_vouchers)
                 conn.execute("""
                     UPDATE exit_vouchers
                     SET
                         total_breakfast_cost = COALESCE((
-                            SELECT SUM(evi.qty_breakfast * evi.unit_price_ttc)
+                            SELECT ROUND(SUM(ROUND(evi.qty_breakfast * evi.unit_price_ttc, 2)), 2)
                             FROM exit_voucher_items evi
                             WHERE evi.voucher_id = exit_vouchers.id
                         ), 0.0),
                         total_lunch_cost = COALESCE((
-                            SELECT SUM(evi.qty_lunch * evi.unit_price_ttc)
+                            SELECT ROUND(SUM(ROUND(evi.qty_lunch * evi.unit_price_ttc, 2)), 2)
                             FROM exit_voucher_items evi
                             WHERE evi.voucher_id = exit_vouchers.id
                         ), 0.0),
                         total_dinner_cost = COALESCE((
-                            SELECT SUM(evi.qty_dinner * evi.unit_price_ttc)
+                            SELECT ROUND(SUM(ROUND(evi.qty_dinner * evi.unit_price_ttc, 2)), 2)
                             FROM exit_voucher_items evi
                             WHERE evi.voucher_id = exit_vouchers.id
                         ), 0.0),
                         total_amount = COALESCE((
-                            SELECT SUM(evi.total_cost)
+                            SELECT ROUND(SUM(ROUND(evi.total_cost, 2)), 2)
                             FROM exit_voucher_items evi
                             WHERE evi.voucher_id = exit_vouchers.id
                         ), 0.0)
@@ -224,13 +247,13 @@ class StockService:
     def save_article(self, data: Dict[str, Any], residence_id: Optional[int] = None, apply_to_all_residences: bool = False, auto_recalculate: bool = True) -> int:
         """إضافة أو تعديل مادة مع حساب وحفظ الأسعار الخاصة بالإقامة أو تعميمها بدقة وعزل تام"""
         r_id = residence_id or data.get("residence_id") or self.residence_id
-        price_ht = float(data.get("price_ht", 0.0))
+        price_ht = round(float(data.get("price_ht", 0.0)), 2)
         discount_rate = float(data.get("discount_rate", 0.0)) # مثلاً 0.05
-        discount_amount = price_ht * discount_rate
-        price_after_discount = price_ht - discount_amount
+        discount_amount = round(price_ht * discount_rate, 2)
+        price_after_discount = round(price_ht - discount_amount, 2)
         tva_raw = float(data.get("tva_rate", 0.0))
         tva_rate = (tva_raw * 100.0) if (0.0 < tva_raw <= 1.0) else tva_raw
-        price_ttc = price_after_discount * (1.0 + (tva_rate / 100.0))
+        price_ttc = round(price_after_discount * (1.0 + (tva_rate / 100.0)), 2)
 
         article_id = data.get("id")
         with self.db.get_connection() as conn:
@@ -1213,15 +1236,16 @@ class StockService:
 
                 final_day_stock = initial_day_stock + sup_qty + li_qty - (bf_qty + lu_qty + di_qty + lo_qty)
 
-                eff_price = k_info.get("unit_price_ttc") if (k_info.get("unit_price_ttc") and k_info.get("unit_price_ttc") > 0) else p_ttc
+                eff_price = round(float(k_info.get("unit_price_ttc") if (k_info.get("unit_price_ttc") and k_info.get("unit_price_ttc") > 0) else p_ttc), 2)
 
-                cost_bf = bf_qty * eff_price
-                cost_lu = lu_qty * eff_price
-                cost_di = di_qty * eff_price
+                cost_bf = round(bf_qty * eff_price, 2)
+                cost_lu = round(lu_qty * eff_price, 2)
+                cost_di = round(di_qty * eff_price, 2)
+                tot_expense_row = round(cost_bf + cost_lu + cost_di, 2)
 
-                tot_bf_expense += cost_bf
-                tot_lu_expense += cost_lu
-                tot_di_expense += cost_di
+                tot_bf_expense = round(tot_bf_expense + cost_bf, 2)
+                tot_lu_expense = round(tot_lu_expense + cost_lu, 2)
+                tot_di_expense = round(tot_di_expense + cost_di, 2)
 
                 articles_rows.append({
                     "id": art_id,
@@ -1240,10 +1264,10 @@ class StockService:
                     "cost_bf": cost_bf,
                     "cost_lu": cost_lu,
                     "cost_di": cost_di,
-                    "total_expense": cost_bf + cost_lu + cost_di
+                    "total_expense": tot_expense_row
                 })
 
-            grand_total_expense = tot_bf_expense + tot_lu_expense + tot_di_expense
+            grand_total_expense = round(tot_bf_expense + tot_lu_expense + tot_di_expense, 2)
 
             # 3. إحصائيات التذاكر وقائمة الطعام
             meal_cur = conn.execute("SELECT * FROM daily_meals_tracking WHERE date = ? AND residence_id = ?", (date_str, r_id))
@@ -1405,10 +1429,10 @@ class StockService:
                 conn.execute("DELETE FROM stock_movements WHERE voucher_id = ? AND movement_type IN ('BREAKFAST_OUT', 'LUNCH_OUT', 'DINNER_OUT') AND residence_id = ?", (r["id"], r_id))
 
             if kitchen_items:
-                tot_bf = sum(it.get("bf_qty", 0) * it["price_ttc"] for it in kitchen_items)
-                tot_lu = sum(it.get("lu_qty", 0) * it["price_ttc"] for it in kitchen_items)
-                tot_di = sum(it.get("di_qty", 0) * it["price_ttc"] for it in kitchen_items)
-                tot_k = tot_bf + tot_lu + tot_di
+                tot_bf = round(sum(round(float(it.get("bf_qty", 0.0) or 0.0) * round(float(it.get("price_ttc", 0.0) or 0.0), 2), 2) for it in kitchen_items), 2)
+                tot_lu = round(sum(round(float(it.get("lu_qty", 0.0) or 0.0) * round(float(it.get("price_ttc", 0.0) or 0.0), 2), 2) for it in kitchen_items), 2)
+                tot_di = round(sum(round(float(it.get("di_qty", 0.0) or 0.0) * round(float(it.get("price_ttc", 0.0) or 0.0), 2), 2) for it in kitchen_items), 2)
+                tot_k = round(tot_bf + tot_lu + tot_di, 2)
 
                 v_num = f"BS-{r_id}-{date_str}-KITCHEN"
                 cur = conn.execute("""
@@ -1424,8 +1448,11 @@ class StockService:
                     lu = float(it.get("lu_qty", 0))
                     di = float(it.get("di_qty", 0))
                     t_qty = bf + lu + di
-                    p = float(it["price_ttc"])
-                    t_cost = t_qty * p
+                    p = round(float(it.get("price_ttc", 0.0) or 0.0), 2)
+                    c_bf = round(bf * p, 2)
+                    c_lu = round(lu * p, 2)
+                    c_di = round(di * p, 2)
+                    t_cost = round(c_bf + c_lu + c_di, 2)
 
                     conn.execute("""
                         INSERT INTO exit_voucher_items (

@@ -2673,15 +2673,21 @@ class DailySheetWidget(QWidget):
 
 
 
-        p = float(it_dict.get("price_ttc", 0.0) or 0.0)
+        p = round(float(it_dict.get("price_ttc", 0.0) or 0.0), 2)
 
-        it_dict["cost_bf"] = bf * p
+        c_bf = round(bf * p, 2)
 
-        it_dict["cost_lu"] = lu * p
+        c_lu = round(lu * p, 2)
 
-        it_dict["cost_di"] = di * p
+        c_di = round(di * p, 2)
 
-        it_dict["total_expense"] = (bf + lu + di) * p
+        it_dict["cost_bf"] = c_bf
+
+        it_dict["cost_lu"] = c_lu
+
+        it_dict["cost_di"] = c_di
+
+        it_dict["total_expense"] = round(c_bf + c_lu + c_di, 2)
 
 
 
@@ -2729,13 +2735,13 @@ class DailySheetWidget(QWidget):
 
     def update_live_totals(self):
 
-        tot_bf = sum(it.get("bf_qty", 0.0) * it.get("price_ttc", 0.0) for it in self.articles_data)
+        tot_bf = round(sum(round(float(it.get("bf_qty", 0.0) or 0.0) * round(float(it.get("price_ttc", 0.0) or 0.0), 2), 2) for it in self.articles_data), 2)
 
-        tot_lu = sum(it.get("lu_qty", 0.0) * it.get("price_ttc", 0.0) for it in self.articles_data)
+        tot_lu = round(sum(round(float(it.get("lu_qty", 0.0) or 0.0) * round(float(it.get("price_ttc", 0.0) or 0.0), 2), 2) for it in self.articles_data), 2)
 
-        tot_di = sum(it.get("di_qty", 0.0) * it.get("price_ttc", 0.0) for it in self.articles_data)
+        tot_di = round(sum(round(float(it.get("di_qty", 0.0) or 0.0) * round(float(it.get("price_ttc", 0.0) or 0.0), 2), 2) for it in self.articles_data), 2)
 
-        tot_grand = tot_bf + tot_lu + tot_di
+        tot_grand = round(tot_bf + tot_lu + tot_di, 2)
 
 
 

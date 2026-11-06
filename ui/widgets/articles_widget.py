@@ -162,13 +162,13 @@ class ArticleDialog(QDialog):
     def calculate_all_prices(self):
         p_ht = self.spn_price_ht.value()
         disc_pct = self.spn_discount.value() / 100.0
-        disc_amt = p_ht * disc_pct
-        p_after = p_ht - disc_amt
+        disc_amt = round(p_ht * disc_pct, 2)
+        p_after = round(p_ht - disc_amt, 2)
 
         tva_str = self.spn_tva.currentText().replace("%", "").strip()
         tva_raw = float(tva_str) if tva_str else 0.0
         tva_val = (tva_raw * 100.0) if (0.0 < tva_raw <= 1.0) else tva_raw
-        p_ttc = p_after * (1.0 + (tva_val / 100.0))
+        p_ttc = round(p_after * (1.0 + (tva_val / 100.0)), 2)
 
         self.lbl_discount_amt.setText(f"{disc_amt:,.2f} دج")
         self.lbl_price_after.setText(f"{p_after:,.2f} دج")
@@ -631,9 +631,9 @@ class ArticlesWidget(QWidget):
         except ValueError:
             tva_val = 0.0
 
-        disc_amt = p_ht * disc_rate
-        p_after = p_ht - disc_amt
-        p_ttc = p_after * (1.0 + (tva_val / 100.0))
+        disc_amt = round(p_ht * disc_rate, 2)
+        p_after = round(p_ht - disc_amt, 2)
+        p_ttc = round(p_after * (1.0 + (tva_val / 100.0)), 2)
 
         self.table_prices.blockSignals(True)
         # تحديث الخلايا المحسوبة
