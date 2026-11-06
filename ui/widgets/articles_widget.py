@@ -217,10 +217,12 @@ class ArticlesWidget(QWidget):
     """
 
     article_saved = pyqtSignal()
+    residence_changed = pyqtSignal(int, str)
 
-    def __init__(self, stock_service: StockService, parent=None):
+    def __init__(self, stock_service: StockService, is_directorate: bool = False, parent=None):
         super().__init__(parent)
         self.stock_svc = stock_service
+        self.is_directorate = is_directorate
         self.sync_svc = SyncService(self.stock_svc.db)
         self.current_residence_id = getattr(self.stock_svc, "residence_id", 1)
         self.current_residence_name = ""
@@ -309,6 +311,24 @@ class ArticlesWidget(QWidget):
         self.cmb_category.currentIndexChanged.connect(self.load_articles)
         fb_layout.addWidget(self.cmb_category, stretch=2)
 
+        # في وضع المديرية: إظهار قائمة اختيار الإقامات للتبديل السريع بين أسعار الإقامات المختلفة
+        if self.is_directorate:
+            self.lbl_res_filter = QLabel("🏢 الإقامة:")
+            self.lbl_res_filter.setStyleSheet("font-weight: bold; color: #38BDF8; font-size: 12px; margin-right: 5px;")
+            self.cmb_residence_filter = QComboBox()
+            self.cmb_residence_filter.setStyleSheet("font-weight: bold; padding: 4px 10px; border: 1px solid #0284C7; border-radius: 6px;")
+            with self.stock_svc.db.get_connection() as conn:
+                res_list = conn.execute("SELECT id, name FROM residences ORDER BY id").fetchall()
+                for r in res_list:
+                    self.cmb_residence_filter.addItem(r["name"], r["id"])
+            for idx in range(self.cmb_residence_filter.count()):
+                if self.cmb_residence_filter.itemData(idx) == self.current_residence_id:
+                    self.cmb_residence_filter.setCurrentIndex(idx)
+                    break
+            self.cmb_residence_filter.currentIndexChanged.connect(self.on_residence_filter_changed)
+            fb_layout.addWidget(self.lbl_res_filter)
+            fb_layout.addWidget(self.cmb_residence_filter, stretch=2)
+
         # زر حفظ التغييرات السعرية البارز
         self.btn_save_changes = QPushButton("💾 حفظ التغييرات")
         self.btn_save_changes.setProperty("class", "btn-primary")
@@ -384,6 +404,13 @@ class ArticlesWidget(QWidget):
         bottom_box.addWidget(lbl_hint)
         bottom_box.addStretch()
 
+        btn_delete = QPushButton("🗑️ حذف المادة المحددة")
+        btn_delete.setProperty("class", "btn-secondary")
+        btn_delete.setStyleSheet("background-color: rgba(239, 68, 68, 0.15); color: #EF4444; border: 1px solid rgba(239, 68, 68, 0.4); font-weight: bold; padding: 6px 14px; border-radius: 6px;")
+        btn_delete.setToolTip("حذف أو إخفاء المادة المحددة بأمان من قائمة الأسعار")
+        btn_delete.clicked.connect(self.delete_selected_article)
+        bottom_box.addWidget(btn_delete)
+
         btn_edit = QPushButton("تعديل المادة المحددة ✏")
         btn_edit.setProperty("class", "btn-secondary")
         btn_edit.clicked.connect(self.open_edit_dialog)
@@ -426,6 +453,16 @@ class ArticlesWidget(QWidget):
 
         root_layout.addWidget(self.tabs)
 
+    def on_residence_filter_changed(self, index: int):
+        """معالجة اختيار الإقامة من القائمة في وضع المديرية"""
+        if not hasattr(self, "cmb_residence_filter") or self.cmb_residence_filter is None:
+            return
+        r_id = self.cmb_residence_filter.currentData()
+        r_name = self.cmb_residence_filter.currentText()
+        if r_id and r_id != self.current_residence_id:
+            self.set_residence(r_id, r_name)
+            self.residence_changed.emit(r_id, r_name)
+
     def set_residence(self, r_id: int, r_name: str):
         """استقبال تغيير الإقامة النشطة وضبط عرض أسعارها حصراً"""
         self.current_residence_id = r_id
@@ -433,6 +470,13 @@ class ArticlesWidget(QWidget):
         self.modified_articles.clear()
         if hasattr(self, "lbl_excel_sub"):
             self.lbl_excel_sub.setText(f"جدول الأسعار التعاقدية والتخفيضات والرسوم - {r_name}")
+        if hasattr(self, "cmb_residence_filter") and self.cmb_residence_filter:
+            self.cmb_residence_filter.blockSignals(True)
+            for idx in range(self.cmb_residence_filter.count()):
+                if self.cmb_residence_filter.itemData(idx) == r_id:
+                    self.cmb_residence_filter.setCurrentIndex(idx)
+                    break
+            self.cmb_residence_filter.blockSignals(False)
         self.load_articles()
 
     def load_articles(self):
@@ -647,12 +691,25 @@ class ArticlesWidget(QWidget):
             self.btn_save_changes.setText("💾 حفظ التغييرات")
             self.btn_save_changes.setStyleSheet("background-color: #059669; color: white; font-weight: bold; font-size: 13px; padding: 6px 20px; border-radius: 6px;")
 
+            # مزامنة الأسعار وتكاليف الإقامة المحدثة مع السحابة فوراً في خيط مستقل
+            try:
+                import threading
+                def _async_cloud_push(target_rid):
+                    try:
+                        self.sync_svc.push_residence_prices(target_rid)
+                        self.sync_svc.push_full_residence_data(target_rid)
+                    except Exception as ex_sync:
+                        print(f"Async cloud push after save_all_price_changes notice: {ex_sync}")
+                threading.Thread(target=_async_cloud_push, args=(r_id,), daemon=True).start()
+            except Exception:
+                pass
+
             self.load_articles()
             self.article_saved.emit()
 
             QMessageBox.information(
                 self, "نجاح الحفظ",
-                f"تم بنجاح حفظ أسعار {saved_count} مادة لـ {res_name}!\nتم تحديث ورقة الاستهلاك والوصولات وكافة الواجهات بالقيم الجديدة."
+                f"تم بنجاح حفظ أسعار {saved_count} مادة لـ {res_name}!\nتم تحديث ورقة الاستهلاك والوصولات وكافة الواجهات بالقيم الجديدة، وحفظ الأسعار في السحابة أيضاً."
             )
         except Exception as e:
             QMessageBox.critical(self, "خطأ في الحفظ", f"حدث خطأ أثناء حفظ الأسعار: {e}")
@@ -751,6 +808,37 @@ class ArticlesWidget(QWidget):
         if dlg.exec():
             self.load_articles()
             self.article_saved.emit()
+
+    def delete_selected_article(self):
+        """حذف أو إخفاء المادة المحددة من جدول الأسعار ودليل المواد"""
+        art = self.get_selected_article()
+        if not art:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد مادة غذائية من الجدول أولاً لحذفها!")
+            return
+
+        art_id = art["id"]
+        art_name = art["name"]
+        art_code = str(art.get("code") or "-")
+
+        reply = QMessageBox.question(
+            self, "تأكيد حذف المادة",
+            f"هل أنت متأكد من حذف المادة الغذائية التالية؟\n\n📌 {art_name} (رقم الحصة: {art_code})\n\n"
+            "سيتم حذف المادة أو إخفاؤها بأمان ولن تظهر في قائمة الأسعار أو وصولات الإدخال والإخراج.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            res = self.stock_svc.delete_article(art_id, residence_id=self.current_residence_id)
+            if res.get("success"):
+                self.load_articles()
+                self.article_saved.emit()
+                QMessageBox.information(self, "نجاح الحذف", res.get("message", "تم حذف المادة بنجاح."))
+            else:
+                QMessageBox.warning(self, "تعذر الحذف", res.get("error", "حدث خطأ أثناء محاولة الحذف."))
+        except Exception as e:
+            QMessageBox.critical(self, "خطأ", f"حدث خطأ أثناء الحذف:\n{e}")
 
     def open_edit_dialog(self):
         art = self.get_selected_article()

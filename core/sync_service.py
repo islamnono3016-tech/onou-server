@@ -463,6 +463,37 @@ class SyncService:
             logger.exception("Error in pull_full_residence_data")
             return {"success": False, "error": f"تعذر سحب البيانات عبر الشبكة: {str(e)}"}
 
+    def push_residence_prices(self, residence_id: int, base_url: Optional[str] = None) -> Dict[str, Any]:
+        """
+        رفع الأسعار المعتمدة لإقامة محددة فوراً إلى الخادم المركزي / السحابة
+        """
+        url = (base_url or AppConfig.get_server_url()).rstrip("/")
+        timeout = AppConfig.get("timeout_seconds", 25.0)
+        try:
+            with self.db.get_connection() as conn:
+                cur = conn.execute("SELECT * FROM residence_articles WHERE residence_id = ?", (residence_id,))
+                cols = [c[0] for c in cur.description] if cur.description else []
+                prices = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            if not prices:
+                return {"success": True, "count": 0}
+
+            endpoint = f"{url}/api/sync/residence_prices"
+            payload = {
+                "residence_id": residence_id,
+                "residence_articles": prices
+            }
+            logger.info(f"Connecting to push residence prices for residence {residence_id}: {endpoint}")
+            r = http_post(endpoint, json=payload, timeout=timeout)
+            if r.status_code == 200:
+                logger.info(f"Successfully pushed {len(prices)} prices for residence {residence_id} to cloud.")
+                return {"success": True, "count": len(prices)}
+            else:
+                return {"success": False, "error": f"Server status: {r.status_code}"}
+        except Exception as e:
+            logger.warning(f"push_residence_prices error: {e}")
+            return {"success": False, "error": str(e)}
+
     def pull_residence_prices(self, residence_id: Optional[int] = None, base_url: Optional[str] = None) -> Dict[str, Any]:
         """
         سحب وتحديث الأسعار المعتمدة لإقامة محددة أو كافة الإقامات من خادم المديرية/السحابة،
@@ -504,6 +535,12 @@ class SyncService:
                     else:
                         CacheService.invalidate_all()
 
+                    try:
+                        from core.stock_service import StockService
+                        StockService(self.db).recalculate_residence_costs_from_prices(r_id)
+                    except Exception:
+                        pass
+
                     logger.info(f"Successfully pulled {len(items)} updated residence prices.")
                     return {"success": True, "count": len(items)}
         except Exception as e:
@@ -537,6 +574,11 @@ class SyncService:
 
                         from core.cache_service import CacheService
                         CacheService.invalidate_articles(r_id)
+                        try:
+                            from core.stock_service import StockService
+                            StockService(self.db).recalculate_residence_costs_from_prices(r_id)
+                        except Exception:
+                            pass
                         return {"success": True, "count": len(items)}
         except Exception as e2:
             logger.error(f"Fallback full pull failed: {e2}")

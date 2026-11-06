@@ -403,8 +403,10 @@ class MainWindow(QMainWindow):
         self.daily_sheet_page.open_loans_requested.connect(self.on_switch_to_loans)
         self.general_info_page.open_daily_sheet_requested.connect(self.on_switch_to_daily_sheet)
 
-        self.articles_page = ArticlesWidget(self.stock_svc)
+        self.articles_page = ArticlesWidget(self.stock_svc, is_directorate=is_admin)
         self.articles_page.article_saved.connect(self.on_articles_prices_saved)
+        if hasattr(self.articles_page, "residence_changed"):
+            self.articles_page.residence_changed.connect(self.set_active_residence)
         self.entry_page = EntryVoucherWidget(
             self.stock_svc,
             is_directorate=is_admin,

@@ -234,21 +234,36 @@ class StockService:
         article_id = data.get("id")
         with self.db.get_connection() as conn:
             if article_id:
+                if "name" in data:
+                    if apply_to_all_residences:
+                        conn.execute("""
+                            UPDATE articles SET
+                                code = ?, name = ?, category_id = ?, unit = ?,
+                                price_ht = ?, discount_rate = ?, discount_amount = ?,
+                                price_after_discount = ?, tva_rate = ?, price_ttc = ?,
+                                safety_stock = ?, is_active = ?
+                            WHERE id = ?
+                        """, (
+                            data.get("code", ""), data["name"], data.get("category_id"),
+                            data.get("unit", "كلغ"), price_ht, discount_rate, discount_amount,
+                            price_after_discount, tva_rate, price_ttc,
+                            float(data.get("safety_stock", 0.0)), int(data.get("is_active", 1)),
+                            article_id
+                        ))
+                    else:
+                        conn.execute("""
+                            UPDATE articles SET
+                                code = ?, name = ?, category_id = ?, unit = ?,
+                                safety_stock = ?, is_active = ?
+                            WHERE id = ?
+                        """, (
+                            data.get("code", ""), data["name"], data.get("category_id"),
+                            data.get("unit", "كلغ"),
+                            float(data.get("safety_stock", 0.0)), int(data.get("is_active", 1)),
+                            article_id
+                        ))
+
                 if apply_to_all_residences:
-                    conn.execute("""
-                        UPDATE articles SET
-                            code = ?, name = ?, category_id = ?, unit = ?,
-                            price_ht = ?, discount_rate = ?, discount_amount = ?,
-                            price_after_discount = ?, tva_rate = ?, price_ttc = ?,
-                            safety_stock = ?, is_active = ?
-                        WHERE id = ?
-                    """, (
-                        data.get("code", ""), data["name"], data.get("category_id"),
-                        data.get("unit", "كلغ"), price_ht, discount_rate, discount_amount,
-                        price_after_discount, tva_rate, price_ttc,
-                        float(data.get("safety_stock", 0.0)), int(data.get("is_active", 1)),
-                        article_id
-                    ))
                     conn.execute("""
                         UPDATE residence_articles SET
                             price_ht = ?, discount_rate = ?, discount_amount = ?,
@@ -256,17 +271,6 @@ class StockService:
                         WHERE article_id = ?
                     """, (price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc, article_id))
                 else:
-                    conn.execute("""
-                        UPDATE articles SET
-                            code = ?, name = ?, category_id = ?, unit = ?,
-                            safety_stock = ?, is_active = ?
-                        WHERE id = ?
-                    """, (
-                        data.get("code", ""), data["name"], data.get("category_id"),
-                        data.get("unit", "كلغ"),
-                        float(data.get("safety_stock", 0.0)), int(data.get("is_active", 1)),
-                        article_id
-                    ))
                     conn.execute("""
                         INSERT INTO residence_articles (
                             residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp,
@@ -300,16 +304,33 @@ class StockService:
                     initial_stock, initial_stock, int(data.get("is_active", 1))
                 ))
                 article_id = cur.lastrowid
-                conn.execute("""
-                    INSERT OR REPLACE INTO residence_articles (
-                        residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp,
+                if apply_to_all_residences:
+                    res_rows = conn.execute("SELECT id FROM residences").fetchall()
+                    for r_row in res_rows:
+                        cur_rid = r_row["id"]
+                        conn.execute("""
+                            INSERT OR REPLACE INTO residence_articles (
+                                residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp,
+                                price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            cur_rid, article_id,
+                            initial_stock if cur_rid == r_id else 0.0,
+                            initial_stock if cur_rid == r_id else 0.0,
+                            float(data.get("safety_stock", 0.0)), price_ttc,
+                            price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc
+                        ))
+                else:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO residence_articles (
+                            residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp,
+                            price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        r_id, article_id, initial_stock, initial_stock,
+                        float(data.get("safety_stock", 0.0)), price_ttc,
                         price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    r_id, article_id, initial_stock, initial_stock,
-                    float(data.get("safety_stock", 0.0)), price_ttc,
-                    price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc
-                ))
+                    ))
                 if initial_stock > 0:
                     conn.execute("""
                         INSERT INTO stock_movements (
@@ -352,6 +373,63 @@ class StockService:
                 pass
 
             return article_id
+
+    def delete_article(self, article_id: int, residence_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        حذف مادة غذائية بأمان: إخفاؤها وحذفها مع الحفاظ التام على سلامة العمليات السابقة في الأرشيف
+        """
+        r_id = residence_id or self.residence_id
+        with self.db.get_connection() as conn:
+            # التحقق من وجود حركات سابقة
+            try:
+                used_entry = conn.execute("SELECT COUNT(*) FROM entry_voucher_items WHERE article_id = ?", (article_id,)).fetchone()[0]
+            except Exception:
+                used_entry = 0
+            try:
+                used_exit = conn.execute("SELECT COUNT(*) FROM exit_voucher_items WHERE article_id = ?", (article_id,)).fetchone()[0]
+            except Exception:
+                used_exit = 0
+            try:
+                used_mv = conn.execute("SELECT COUNT(*) FROM stock_movements WHERE article_id = ?", (article_id,)).fetchone()[0]
+            except Exception:
+                used_mv = 0
+            total_used = used_entry + used_exit + used_mv
+
+            if total_used > 0:
+                # المادة مستخدمة في عمليات سابقة -> تعطيل وإخفاء المادة لمنع ظهورها مستقبلاً دون إفساد الأرشيف
+                conn.execute("UPDATE articles SET is_active = 0 WHERE id = ?", (article_id,))
+                conn.execute("DELETE FROM residence_articles WHERE article_id = ? AND residence_id = ?", (article_id, r_id))
+                conn.commit()
+                msg = f"تم إخفاء وتعطيل المادة بنجاح من قائمة الأسعار (تم الحفاظ على {total_used} حركة سابقة مسجلة في الأرشيف)."
+            else:
+                # المادة جديدة ولم تسجل عليها أي حركة -> حذف فيزيائي نهائي كامل
+                conn.execute("DELETE FROM residence_articles WHERE article_id = ?", (article_id,))
+                conn.execute("DELETE FROM articles WHERE id = ?", (article_id,))
+                conn.commit()
+                msg = "تم حذف المادة الغذائية نهائياً بنجاح."
+
+        try:
+            from core.cache_service import CacheService
+            CacheService.invalidate_all()
+        except Exception:
+            pass
+
+        # مزامنة الحذف مع السحابة فوراً في خيط مستقل
+        try:
+            import threading
+            def _async_push_del():
+                try:
+                    from core.sync_service import SyncService
+                    s_svc = SyncService(self.db)
+                    s_svc.push_residence_prices(r_id)
+                    s_svc.push_full_residence_data(r_id)
+                except Exception as ex_p:
+                    logger.warning(f"Async push after delete_article failed: {ex_p}")
+            threading.Thread(target=_async_push_del, daemon=True).start()
+        except Exception:
+            pass
+
+        return {"success": True, "message": msg}
 
     # -------------------------------------------------------------
     # وصولات الدخول / التوريد والاستعارة (Entry Vouchers)
