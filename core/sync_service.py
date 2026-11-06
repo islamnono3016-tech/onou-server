@@ -515,6 +515,9 @@ class SyncService:
                 if items:
                     with self.db.get_connection() as conn:
                         for row in items:
+                            if 'tva_rate' in row and row['tva_rate'] is not None:
+                                tva_raw = float(row['tva_rate'])
+                                row['tva_rate'] = (tva_raw * 100.0) if (0.0 < tva_raw <= 1.0) else tva_raw
                             cols = [k for k in row.keys() if k in (
                                 "residence_id", "article_id", "price_ht", "discount_rate",
                                 "discount_amount", "price_after_discount", "tva_rate", "price_ttc"

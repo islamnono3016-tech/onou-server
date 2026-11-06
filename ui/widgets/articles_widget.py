@@ -99,7 +99,8 @@ class ArticleDialog(QDialog):
         # 5. ض ق م (TVA)
         self.spn_tva = QComboBox()
         self.spn_tva.addItems(["0 %", "9 %", "19 %"])
-        tva_val = int(self.article_data.get("tva_rate", 0))
+        raw_tva = float(self.article_data.get("tva_rate", 0.0) or 0.0)
+        tva_val = int(round(raw_tva * 100)) if (0.0 < raw_tva <= 1.0) else int(round(raw_tva))
         self.spn_tva.setCurrentText(f"{tva_val} %")
 
         # 6. السعر بكامل الرسوم (TTC)
@@ -165,7 +166,8 @@ class ArticleDialog(QDialog):
         p_after = p_ht - disc_amt
 
         tva_str = self.spn_tva.currentText().replace("%", "").strip()
-        tva_val = float(tva_str) if tva_str else 0.0
+        tva_raw = float(tva_str) if tva_str else 0.0
+        tva_val = (tva_raw * 100.0) if (0.0 < tva_raw <= 1.0) else tva_raw
         p_ttc = p_after * (1.0 + (tva_val / 100.0))
 
         self.lbl_discount_amt.setText(f"{disc_amt:,.2f} دج")
@@ -513,7 +515,8 @@ class ArticlesWidget(QWidget):
             disc_rate = mod_data.get("discount_rate", float(art.get("discount_rate") or 0.0))
             disc_amt = mod_data.get("discount_amount", float(art.get("discount_amount") or (p_ht * disc_rate)))
             p_after = mod_data.get("price_after_discount", float(art.get("price_after_discount") or (p_ht - disc_amt)))
-            tva_val = mod_data.get("tva_rate", float(art.get("tva_rate") or 0.0))
+            raw_tva = mod_data.get("tva_rate", float(art.get("tva_rate") or 0.0))
+            tva_val = (raw_tva * 100.0) if (0.0 < raw_tva <= 1.0) else raw_tva
             p_ttc = mod_data.get("price_ttc", art["price_ttc"])
 
             # 0. رقم الحصة
@@ -623,7 +626,8 @@ class ArticlesWidget(QWidget):
 
         try:
             tva_str = self.table_prices.item(row, 7).text().replace("%", "").replace(" ", "").strip()
-            tva_val = max(0.0, float(tva_str)) if tva_str else 0.0
+            tva_raw = max(0.0, float(tva_str)) if tva_str else 0.0
+            tva_val = (tva_raw * 100.0) if (0.0 < tva_raw <= 1.0) else tva_raw
         except ValueError:
             tva_val = 0.0
 
@@ -973,8 +977,9 @@ class ArticlesWidget(QWidget):
 
                     disc_amt = round(p_ht * disc_rate, 4)
                     p_after = round(p_ht - disc_amt, 4)
+                    tva_val = (tva * 100.0) if (0.0 < tva <= 1.0) else tva
                     if p_ttc <= 0:
-                        p_ttc = round(p_after * (1.0 + tva), 4)
+                        p_ttc = round(p_after * (1.0 + (tva_val / 100.0)), 4)
 
                     art_id = r - 2
                     cur_find = conn.execute("SELECT id FROM articles WHERE id = ? OR name = ?", (art_id, name)).fetchone()
@@ -992,14 +997,14 @@ class ArticlesWidget(QWidget):
                                 price_after_discount = excluded.price_after_discount,
                                 tva_rate = excluded.tva_rate,
                                 price_ttc = excluded.price_ttc
-                        """, (r_id, real_id, p_ttc, p_ht, disc_rate, disc_amt, p_after, tva, p_ttc))
+                        """, (r_id, real_id, p_ttc, p_ht, disc_rate, disc_amt, p_after, tva_val, p_ttc))
 
                         conn.execute("""
                             UPDATE articles SET
                                 price_ht = ?, discount_rate = ?, discount_amount = ?,
                                 price_after_discount = ?, tva_rate = ?, price_ttc = ?, current_pmp = ?
                             WHERE id = ?
-                        """, (p_ht, disc_rate, disc_amt, p_after, tva, p_ttc, p_ttc, real_id))
+                        """, (p_ht, disc_rate, disc_amt, p_after, tva_val, p_ttc, p_ttc, real_id))
                         updated_count += 1
                 conn.commit()
 

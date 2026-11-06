@@ -2080,7 +2080,9 @@ class ReportGenerator:
             disc_pct_txt = f"{int(it['discount_rate'] * 100)}%" if it["discount_rate"] > 0 else "0%"
             disc_amt = it["discount_amount"] or (it["price_ht"] * it["discount_rate"])
             p_after = it["price_after_discount"] or (it["price_ht"] - disc_amt)
-            tva_txt = f"{int(it['tva_rate'])}%" if it["tva_rate"] > 0 else "0%"
+            raw_tva = float(it.get("tva_rate") or 0.0)
+            tva_pct = int(round(raw_tva * 100.0)) if (0.0 < raw_tva <= 1.0) else int(round(raw_tva))
+            tva_txt = f"{tva_pct}%" if tva_pct > 0 else "0%"
 
             rows_html += f"""
             <tr>
@@ -2327,7 +2329,9 @@ class ReportGenerator:
             c_pa = ws.cell(row_idx, 7, p_after)
             c_pa.number_format = "#,##0.00"
 
-            c_tva = ws.cell(row_idx, 8, it["tva_rate"] / 100.0)
+            raw_tva = float(it.get("tva_rate") or 0.0)
+            tva_factor = (raw_tva / 100.0) if raw_tva > 1.0 else raw_tva
+            c_tva = ws.cell(row_idx, 8, tva_factor)
             c_tva.number_format = "0%"
             c_tva.alignment = Alignment(horizontal="center")
 

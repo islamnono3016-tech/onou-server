@@ -228,7 +228,8 @@ class StockService:
         discount_rate = float(data.get("discount_rate", 0.0)) # مثلاً 0.05
         discount_amount = price_ht * discount_rate
         price_after_discount = price_ht - discount_amount
-        tva_rate = float(data.get("tva_rate", 0.0)) # 0, 9, 19
+        tva_raw = float(data.get("tva_rate", 0.0))
+        tva_rate = (tva_raw * 100.0) if (0.0 < tva_raw <= 1.0) else tva_raw
         price_ttc = price_after_discount * (1.0 + (tva_rate / 100.0))
 
         article_id = data.get("id")
