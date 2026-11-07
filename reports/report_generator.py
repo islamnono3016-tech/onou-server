@@ -1130,23 +1130,25 @@ class ReportGenerator:
         else:
             period_title = f"جدول تفصيلي لشهر {m_name} {year}"
 
-        logo_img_html = self.get_logo_img_html(36)
+        logo_img_html = self.get_logo_img_html(30)
         gov_header_html = f"""
-        <table width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-bottom:2px; border-collapse:collapse;">
+        <table width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-bottom:1px; border-collapse:collapse;">
             <tr>
-                <td align="right" style="text-align:right; font-size:7.5pt; font-weight:bold; vertical-align:middle; border:none; width:35%; padding:0;">
+                <td align="right" style="text-align:right; font-size:7.5pt; font-weight:bold; vertical-align:middle; border:none; width:40%; padding:0;">
                     الجمهورية الجزائرية الديمقراطية الشعبية<br>
                     {dir_name}<br>{res_name}
                 </td>
-                <td align="center" style="border:none; width:30%; text-align:center; vertical-align:middle; padding:0;">
-                    {logo_img_html}<br>
-                    <span style="color:#1E7E34; font-size:11pt; font-weight:bold;">{period_title}</span>
+                <td align="center" style="border:none; width:20%; text-align:center; vertical-align:middle; padding:0;">
+                    {logo_img_html}
                 </td>
-                <td align="left" style="text-align:left; font-size:7.5pt; font-weight:bold; vertical-align:middle; border:none; width:35%; padding:0;">
+                <td align="left" style="text-align:left; font-size:7.5pt; font-weight:bold; vertical-align:middle; border:none; width:40%; padding:0;">
                     وزارة التعليم العالي والبحث العلمي<br>{onou_name}
                 </td>
             </tr>
         </table>
+        <div style="text-align:center; color:#1E7E34; font-size:11pt; font-weight:bold; margin-top:1px; margin-bottom:3px; white-space:nowrap;">
+            {period_title}
+        </div>
         """
 
         thead_html = """
@@ -1359,23 +1361,25 @@ class ReportGenerator:
         grand_avg_day_cost = (tot_expense / tot_avg_4) if tot_avg_4 > 0 else 0.0
         grand_avg_meal_cost = (grand_avg_day_cost / 2.0) if tot_di_all > 0 else grand_avg_day_cost
 
-        logo_img_html = self.get_logo_img_html(36)
+        logo_img_html = self.get_logo_img_html(30)
         gov_header_html = f"""
-        <table width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-bottom:2px; border-collapse:collapse;">
+        <table width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-bottom:1px; border-collapse:collapse;">
             <tr>
-                <td align="right" style="text-align:right; font-size:7.5pt; font-weight:bold; vertical-align:middle; border:none; width:35%; padding:0;">
+                <td align="right" style="text-align:right; font-size:7.5pt; font-weight:bold; vertical-align:middle; border:none; width:40%; padding:0;">
                     الجمهورية الجزائرية الديمقراطية الشعبية<br>
                     {dir_name}<br>{res_name}
                 </td>
-                <td align="center" style="border:none; width:30%; text-align:center; vertical-align:middle; padding:0;">
-                    {logo_img_html}<br>
-                    <span style="color:#1E7E34; font-size:11pt; font-weight:bold;">{period_title}</span>
+                <td align="center" style="border:none; width:20%; text-align:center; vertical-align:middle; padding:0;">
+                    {logo_img_html}
                 </td>
-                <td align="left" style="text-align:left; font-size:7.5pt; font-weight:bold; vertical-align:middle; border:none; width:35%; padding:0;">
+                <td align="left" style="text-align:left; font-size:7.5pt; font-weight:bold; vertical-align:middle; border:none; width:40%; padding:0;">
                     وزارة التعليم العالي والبحث العلمي<br>{onou_name}
                 </td>
             </tr>
         </table>
+        <div style="text-align:center; color:#1E7E34; font-size:11pt; font-weight:bold; margin-top:1px; margin-bottom:3px; white-space:nowrap;">
+            {period_title}
+        </div>
         """
 
         thead_html = """
@@ -1417,16 +1421,16 @@ class ReportGenerator:
         """
 
         signatures_html = """
-        <table width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-top:2px; border-collapse:collapse;">
+        <table width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-top:12px; margin-bottom:4px; border-collapse:collapse;">
             <tr>
-                <td style="width:33.3%; text-align:center; font-weight:bold; font-size:7.5pt; border:none; padding:0;">
-                    إمضاء مدير الإقامة: ..............................
+                <td style="width:33.3%; text-align:center; font-weight:bold; font-size:8pt; border:none; padding:0;">
+                    إمضاء مدير الإقامة<br><br>..............................
                 </td>
-                <td style="width:33.4%; text-align:center; font-weight:bold; font-size:7.5pt; border:none; padding:0;">
-                    تأشيرة مدير الخدمات: ..............................
+                <td style="width:33.4%; text-align:center; font-weight:bold; font-size:8pt; border:none; padding:0;">
+                    تأشيرة مدير الخدمات<br><br>..............................
                 </td>
-                <td style="width:33.3%; text-align:center; font-weight:bold; font-size:7.5pt; border:none; padding:0;">
-                    إمضاء رئيس المصلحة: ..............................
+                <td style="width:33.3%; text-align:center; font-weight:bold; font-size:8pt; border:none; padding:0;">
+                    إمضاء رئيس المصلحة<br><br>..............................
                 </td>
             </tr>
         </table>
