@@ -544,7 +544,7 @@ class ReportsWidget(QWidget):
         row_filters.setSpacing(10)
 
         self.spn_an_year = QSpinBox(); self.spn_an_year.setRange(2020, 2035); self.spn_an_year.setValue(2026)
-        self.spn_an_year.setFixedWidth(95); self.spn_an_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.spn_an_year.setFixedWidth(110); self.spn_an_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.cmb_an_month = QComboBox()
         self.cmb_an_month.setFixedWidth(145)
@@ -633,7 +633,7 @@ class ReportsWidget(QWidget):
         row_filters.setSpacing(10)
 
         self.spn_am_year = QSpinBox(); self.spn_am_year.setRange(2020, 2035); self.spn_am_year.setValue(2026)
-        self.spn_am_year.setFixedWidth(95); self.spn_am_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.spn_am_year.setFixedWidth(110); self.spn_am_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.cmb_am_month = QComboBox()
         self.cmb_am_month.setFixedWidth(145)
@@ -722,7 +722,7 @@ class ReportsWidget(QWidget):
         row_filters.setSpacing(10)
 
         self.spn_jard_year = QSpinBox(); self.spn_jard_year.setRange(2020, 2035); self.spn_jard_year.setValue(2026)
-        self.spn_jard_year.setFixedWidth(95); self.spn_jard_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.spn_jard_year.setFixedWidth(110); self.spn_jard_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.cmb_jard_month = QComboBox()
         self.cmb_jard_month.setFixedWidth(145)
@@ -811,7 +811,7 @@ class ReportsWidget(QWidget):
         row_filters.setSpacing(10)
 
         self.spn_det_year = QSpinBox(); self.spn_det_year.setRange(2020, 2035); self.spn_det_year.setValue(2026)
-        self.spn_det_year.setFixedWidth(95); self.spn_det_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.spn_det_year.setFixedWidth(110); self.spn_det_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.cmb_det_month = QComboBox()
         self.cmb_det_month.setFixedWidth(145)
@@ -900,7 +900,7 @@ class ReportsWidget(QWidget):
         row_filters.setSpacing(10)
 
         self.spn_meals_year = QSpinBox(); self.spn_meals_year.setRange(2020, 2035); self.spn_meals_year.setValue(2026)
-        self.spn_meals_year.setFixedWidth(95); self.spn_meals_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.spn_meals_year.setFixedWidth(110); self.spn_meals_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.cmb_meals_month = QComboBox()
         self.cmb_meals_month.setFixedWidth(145)
@@ -991,7 +991,7 @@ class ReportsWidget(QWidget):
 
         lbl_year = QLabel("السنة:"); lbl_year.setStyleSheet("font-weight: bold; color: #CBD5E1; font-size: 13px;")
         self.spn_sc_year = QSpinBox(); self.spn_sc_year.setRange(2020, 2035); self.spn_sc_year.setValue(2026)
-        self.spn_sc_year.setFixedWidth(85); self.spn_sc_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.spn_sc_year.setFixedWidth(110); self.spn_sc_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         lbl_month = QLabel("الشهر:"); lbl_month.setStyleSheet("font-weight: bold; color: #CBD5E1; font-size: 13px;")
         self.cmb_sc_month = QComboBox()
@@ -1136,7 +1136,7 @@ class ReportsWidget(QWidget):
 
         lbl_year = QLabel("السنة:"); lbl_year.setStyleSheet("font-weight: bold; color: #CBD5E1; font-size: 13px;")
         self.spn_sit_year = QSpinBox(); self.spn_sit_year.setRange(2020, 2035); self.spn_sit_year.setValue(2026)
-        self.spn_sit_year.setFixedWidth(85); self.spn_sit_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.spn_sit_year.setFixedWidth(110); self.spn_sit_year.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         lbl_tri = QLabel("الثلاثي:"); lbl_tri.setStyleSheet("font-weight: bold; color: #CBD5E1; font-size: 13px;")
         self.cmb_sit_tri = QComboBox()
@@ -1175,7 +1175,7 @@ class ReportsWidget(QWidget):
         btn_ref.setMinimumHeight(34)
         btn_ref.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_ref.setStyleSheet("background-color: #1E293B; border: 1.5px solid #475569; color: #F8FAFC; font-weight: bold; border-radius: 6px; padding: 6px 14px;")
-        btn_ref.clicked.connect(self.generate_situation_preview)
+        btn_ref.clicked.connect(self.on_situation_period_changed)
         row_actions.addWidget(btn_ref)
 
         # 2. الحصة / المورد في الوسط (المكان المحدد بالدائرة الحمراء تماماً)
@@ -1225,6 +1225,9 @@ class ReportsWidget(QWidget):
         self.browser_situation.setStyleSheet("background: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 6px;")
         attach_smooth_scroll(self.browser_situation)
         l.addWidget(self.browser_situation)
+
+        # تحميل الحصص والتقرير فورياً عند بناء التبويب
+        self.on_situation_period_changed()
 
     def on_situation_period_changed(self):
         if hasattr(self, "chk_sit_range") and self.chk_sit_range.isChecked():
@@ -1290,7 +1293,7 @@ class ReportsWidget(QWidget):
         elif idx == 4: self.generate_detailed_preview()
         elif idx == 5: self.generate_meals_preview()
         elif idx == 6: self.generate_stock_card_preview()
-        elif idx == 7: self.generate_situation_preview()
+        elif idx == 7: self.on_situation_period_changed()
 
     def set_directorate_mode(self, is_directorate: bool):
         """ضبط وضع المديرية أو الإقامة لشريط اختيار الإقامة"""

@@ -810,16 +810,25 @@ class StockService:
 
         r_id = residence_id or self.residence_id
         with self.db.get_connection() as conn:
-            art = conn.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
+            art = conn.execute("""
+                SELECT a.*,
+                       COALESCE(ra.price_ht, a.price_ht) as price_ht,
+                       COALESCE(ra.discount_rate, a.discount_rate) as discount_rate,
+                       COALESCE(ra.discount_amount, a.discount_amount) as discount_amount,
+                       COALESCE(ra.price_after_discount, a.price_after_discount) as price_after_discount,
+                       COALESCE(ra.tva_rate, a.tva_rate) as tva_rate,
+                       COALESCE(ra.price_ttc, a.price_ttc) as price_ttc,
+                       COALESCE(ra.current_stock, a.current_stock) as current_stock,
+                       COALESCE(ra.safety_stock, a.safety_stock) as safety_stock,
+                       COALESCE(ra.initial_stock, a.initial_stock) as initial_stock
+                FROM articles a
+                LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                WHERE a.id = ?
+            """, (r_id, article_id)).fetchone()
             if not art:
                 return {}
 
-            # جلب المخزون الأولي للإقامة المحددة
-            init_row = conn.execute(
-                "SELECT initial_stock FROM residence_articles WHERE article_id = ? AND residence_id = ?",
-                (article_id, r_id)
-            ).fetchone()
-            init_base = (init_row["initial_stock"] if (init_row and init_row["initial_stock"] is not None) else 0.0)
+            init_base = float(art["initial_stock"] or 0.0)
 
             # حساب رصيد بداية الفترة
             prior_in = conn.execute("""
@@ -962,15 +971,26 @@ class StockService:
 
         r_id = residence_id or self.residence_id
         with self.db.get_connection() as conn:
-            articles = conn.execute("SELECT * FROM articles WHERE is_active = 1 ORDER BY id ASC").fetchall()
+            articles = conn.execute("""
+                SELECT a.id, a.code, a.name, a.unit, a.category_id,
+                       COALESCE(ra.price_ht, a.price_ht) as price_ht,
+                       COALESCE(ra.discount_rate, a.discount_rate) as discount_rate,
+                       COALESCE(ra.discount_amount, a.discount_amount) as discount_amount,
+                       COALESCE(ra.price_after_discount, a.price_after_discount) as price_after_discount,
+                       COALESCE(ra.tva_rate, a.tva_rate) as tva_rate,
+                       COALESCE(ra.price_ttc, a.price_ttc) as price_ttc,
+                       COALESCE(ra.current_stock, a.current_stock) as current_stock,
+                       COALESCE(ra.safety_stock, a.safety_stock) as safety_stock,
+                       COALESCE(ra.initial_stock, a.initial_stock) as initial_stock
+                FROM articles a
+                LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                WHERE a.is_active = 1
+                ORDER BY a.id ASC
+            """, (r_id,)).fetchall()
 
-            # 0. جلب المخزون الأولي للإقامة المحددة من جدول residence_articles
             init_stocks = {
-                r["article_id"]: (r["initial_stock"] or 0.0)
-                for r in conn.execute(
-                    "SELECT article_id, initial_stock FROM residence_articles WHERE residence_id = ?",
-                    (r_id,)
-                ).fetchall()
+                r["id"]: float(r["initial_stock"] or 0.0)
+                for r in articles
             }
 
             # 1. تجميع كل حركات ما قبل هذه الفترة لجميع المواد
@@ -1017,6 +1037,7 @@ class StockService:
 
                 final_qty = (init_qty + sup_qty + loan_in_qty) - (cons_qty + loan_out_qty)
 
+                p_ttc = round(float(p_ttc or 0.0), 2)
                 inventory_rows.append({
                     "article_id": art_id,
                     "code": art["code"],
@@ -1024,17 +1045,17 @@ class StockService:
                     "unit": art["unit"],
                     "price_ttc": p_ttc,
                     "initial_qty": init_qty,
-                    "initial_val": init_qty * p_ttc,
+                    "initial_val": round(init_qty * p_ttc, 2),
                     "supply_qty": sup_qty,
-                    "supply_val": sup_qty * p_ttc,
+                    "supply_val": round(sup_qty * p_ttc, 2),
                     "loan_in_qty": loan_in_qty,
-                    "loan_in_val": loan_in_qty * p_ttc,
+                    "loan_in_val": round(loan_in_qty * p_ttc, 2),
                     "cons_qty": cons_qty,
-                    "cons_val": cons_qty * p_ttc,
+                    "cons_val": round(cons_qty * p_ttc, 2),
                     "loan_out_qty": loan_out_qty,
-                    "loan_out_val": loan_out_qty * p_ttc,
+                    "loan_out_val": round(loan_out_qty * p_ttc, 2),
                     "final_qty": final_qty,
-                    "final_val": final_qty * p_ttc
+                    "final_val": round(final_qty * p_ttc, 2)
                 })
 
             return inventory_rows
@@ -1241,7 +1262,7 @@ class StockService:
 
                 final_day_stock = initial_day_stock + sup_qty + li_qty - (bf_qty + lu_qty + di_qty + lo_qty)
 
-                eff_price = round(float(k_info.get("unit_price_ttc") if (k_info.get("unit_price_ttc") and k_info.get("unit_price_ttc") > 0) else p_ttc), 2)
+                eff_price = round(float(p_ttc or 0.0), 2)
 
                 cost_bf = round(bf_qty * eff_price, 2)
                 cost_lu = round(lu_qty * eff_price, 2)
@@ -1978,6 +1999,7 @@ class StockService:
         وضعية المدخولات للثلاثي (1، 2، 3) أو لفترة مخصصة ومقارنتها مع حصص المديرية:
         الحصة الممنوحة vs المدخولات الفعلية + الفوارق بالكمية والمبلغ
         مطابقة 100% لملف عبد الحميد الوضعية.xlsx المعتمد في مديرية الخدمات الجامعية
+        مع عزل وتطبيق الأسعار المعدلة لكل إقامة فورياً وتحديث تلقائي لجميع الحصص والموردين
         """
         r_id = residence_id or self.residence_id
         if start_date and end_date:
@@ -2007,43 +2029,31 @@ class StockService:
             end_date_str = f"{rep_year:04d}-{last_m:02d}-{last_d:02d}"
 
         with self.db.get_connection() as conn:
-            # 1. قائمة الحصص المتوفرة لملء قائمة التصفية المخصصة لهذه الإقامة حصراً
-            if trimester:
-                dist_lots = [
-                    r[0] for r in conn.execute("""
-                        SELECT DISTINCT lot_name FROM supplier_allocations
-                        WHERE year = ? AND trimester = ? AND residence_id = ? AND lot_name IS NOT NULL
-                        ORDER BY lot_name ASC
-                    """, (rep_year, trimester, r_id)).fetchall()
-                ]
-            else:
-                dist_lots = [
-                    r[0] for r in conn.execute("""
-                        SELECT DISTINCT lot_name FROM supplier_allocations
-                        WHERE year = ? AND residence_id = ? AND lot_name IS NOT NULL
-                        ORDER BY lot_name ASC
-                    """, (rep_year, r_id)).fetchall()
-                ]
-
-            # 2. بناء استعلام جلب الحصص المخصصة للإقامة المحددة
+            # 1. بناء استعلام جلب الحصص المخصصة للإقامة المحددة مع سحب أسعار الإقامة بدقة
             if trimester:
                 query = """
-                    SELECT sa.*, a.name as article_name, a.unit, a.code, a.price_ttc, s.name as supplier_name
+                    SELECT sa.*, a.name as article_name, a.unit, a.code,
+                           COALESCE(ra.price_ttc, a.price_ttc) as price_ttc,
+                           s.name as supplier_name
                     FROM supplier_allocations sa
                     JOIN articles a ON sa.article_id = a.id
+                    LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
                     LEFT JOIN suppliers s ON sa.supplier_id = s.id
                     WHERE sa.year = ? AND sa.trimester = ? AND sa.residence_id = ?
                 """
-                params = [rep_year, trimester, r_id]
+                params = [r_id, rep_year, trimester, r_id]
             else:
                 query = """
-                    SELECT sa.*, a.name as article_name, a.unit, a.code, a.price_ttc, s.name as supplier_name
+                    SELECT sa.*, a.name as article_name, a.unit, a.code,
+                           COALESCE(ra.price_ttc, a.price_ttc) as price_ttc,
+                           s.name as supplier_name
                     FROM supplier_allocations sa
                     JOIN articles a ON sa.article_id = a.id
+                    LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
                     LEFT JOIN suppliers s ON sa.supplier_id = s.id
                     WHERE sa.year = ? AND sa.residence_id = ?
                 """
-                params = [rep_year, r_id]
+                params = [r_id, rep_year, r_id]
 
             if lot_name and lot_name != "ALL":
                 query += " AND sa.lot_name = ?"
@@ -2055,7 +2065,7 @@ class StockService:
             query += " ORDER BY sa.lot_name ASC, a.id ASC"
             alloc_rows = conn.execute(query, params).fetchall()
 
-            # 3. جلب المدخولات الفعلية من وصولات الاستلام المخصصة لهذه الإقامة حصراً
+            # 2. جلب المدخولات الفعلية من وصولات الاستلام المخصصة لهذه الإقامة حصراً
             sup_cur = conn.execute("""
                 SELECT evi.article_id, SUM(evi.quantity) as actual_qty, SUM(evi.total_price) as actual_amount
                 FROM entry_voucher_items evi
@@ -2063,7 +2073,7 @@ class StockService:
                 WHERE ev.date >= ? AND ev.date <= ? AND ev.voucher_type = 'SUPPLIER' AND ev.residence_id = ?
                 GROUP BY evi.article_id
             """, (start_date_str, end_date_str, r_id))
-            sup_map = {r["article_id"]: {"qty": r["actual_qty"], "amt": r["actual_amount"]} for r in sup_cur.fetchall()}
+            sup_map = {r["article_id"]: {"qty": float(r["actual_qty"] or 0.0), "amt": float(r["actual_amount"] or 0.0)} for r in sup_cur.fetchall()}
 
             items_list = []
             lots_dict = {}
@@ -2072,23 +2082,25 @@ class StockService:
             tot_allocated_amt = 0.0
             tot_actual_qty = 0.0
             tot_actual_amt = 0.0
+            tot_diff_qty_excess = 0.0
+            tot_diff_qty_deficit = 0.0
             tot_diff_amt_excess = 0.0
             tot_diff_amt_deficit = 0.0
 
             for i, sa in enumerate(alloc_rows, 1):
                 art_id = sa["article_id"]
-                p = sa["contract_price"] if sa["contract_price"] > 0 else sa["price_ttc"]
-                alloc_q = sa["allocated_qty"]
-                alloc_a = alloc_q * p
+                p = round(float(sa["contract_price"] if (sa["contract_price"] and sa["contract_price"] > 0) else (sa["price_ttc"] or 0.0)), 2)
+                alloc_q = float(sa["allocated_qty"] or 0.0)
+                alloc_a = round(alloc_q * p, 2)
 
-                # المدخول الفعلي: الأولوية لوصولات التوريد إن وجدت، وإلا المدخول المسجل في ملف عبد الحميد
+                # المدخول الفعلي: الأولوية لوصولات التوريد إن وجدت، وإلا المدخول المسجل في جدول التخصيص
                 actual = sup_map.get(art_id, {"qty": 0.0, "amt": 0.0})
-                excel_act_q = sa["excel_actual_qty"] if "excel_actual_qty" in sa.keys() else 0.0
+                excel_act_q = float(sa["excel_actual_qty"]) if ("excel_actual_qty" in sa.keys() and sa["excel_actual_qty"]) else 0.0
                 act_q = actual["qty"] if actual["qty"] > 0 else excel_act_q
-                act_a = act_q * p
+                act_a = round(act_q * p, 2)
 
                 diff_q = act_q - alloc_q
-                diff_a = act_a - alloc_a
+                diff_a = round(act_a - alloc_a, 2)
 
                 diff_q_excess = diff_q if diff_q > 0 else 0.0
                 diff_q_deficit = abs(diff_q) if diff_q < 0 else 0.0
@@ -2097,11 +2109,13 @@ class StockService:
                 diff_a_deficit = abs(diff_a) if diff_a < 0 else 0.0
 
                 tot_allocated_qty += alloc_q
-                tot_allocated_amt += alloc_a
+                tot_allocated_amt = round(tot_allocated_amt + alloc_a, 2)
                 tot_actual_qty += act_q
-                tot_actual_amt += act_a
-                tot_diff_amt_excess += diff_a_excess
-                tot_diff_amt_deficit += diff_a_deficit
+                tot_actual_amt = round(tot_actual_amt + act_a, 2)
+                tot_diff_qty_excess += diff_q_excess
+                tot_diff_qty_deficit += diff_q_deficit
+                tot_diff_amt_excess = round(tot_diff_amt_excess + diff_a_excess, 2)
+                tot_diff_amt_deficit = round(tot_diff_amt_deficit + diff_a_deficit, 2)
 
                 c_lot = sa["lot_name"] or "حصة عامة"
                 c_supp = sa["supplier_name"] or "المورد العام"
@@ -2136,42 +2150,58 @@ class StockService:
                         "tot_allocated_amt": 0.0,
                         "tot_actual_qty": 0.0,
                         "tot_actual_amt": 0.0,
+                        "tot_diff_qty_excess": 0.0,
+                        "tot_diff_qty_deficit": 0.0,
                         "tot_diff_amt_excess": 0.0,
                         "tot_diff_amt_deficit": 0.0
                     }
                 l_grp = lots_dict[c_lot]
                 l_grp["items"].append(item_obj)
                 l_grp["tot_allocated_qty"] += alloc_q
-                l_grp["tot_allocated_amt"] += alloc_a
+                l_grp["tot_allocated_amt"] = round(l_grp["tot_allocated_amt"] + alloc_a, 2)
                 l_grp["tot_actual_qty"] += act_q
-                l_grp["tot_actual_amt"] += act_a
-                l_grp["tot_diff_amt_excess"] += diff_a_excess
-                l_grp["tot_diff_amt_deficit"] += diff_a_deficit
+                l_grp["tot_actual_amt"] = round(l_grp["tot_actual_amt"] + act_a, 2)
+                l_grp["tot_diff_qty_excess"] += diff_q_excess
+                l_grp["tot_diff_qty_deficit"] += diff_q_deficit
+                l_grp["tot_diff_amt_excess"] = round(l_grp["tot_diff_amt_excess"] + diff_a_excess, 2)
+                l_grp["tot_diff_amt_deficit"] = round(l_grp["tot_diff_amt_deficit"] + diff_a_deficit, 2)
 
-            # إذا كانت هناك وصولات توريد فعلية مسجلة لهذه الإقامة لمواد غير مدرجة في جدول الحصص
+            # 3. إدراج المواد الموردة فعلياً لهذه الإقامة والتي لم تسجل مسبقاً في جدول التخصيص
             allocated_art_ids = {sa["article_id"] for sa in alloc_rows}
             unallocated_art_ids = [aid for aid in sup_map.keys() if aid not in allocated_art_ids]
             if unallocated_art_ids:
-                q_extra = f"SELECT a.id, a.code, a.name as article_name, a.unit, a.price_ttc, c.name as category_name FROM articles a LEFT JOIN categories c ON a.category_id = c.id WHERE a.id IN ({','.join(['?']*len(unallocated_art_ids))})"
-                extra_arts = {a["id"]: a for a in conn.execute(q_extra, unallocated_art_ids).fetchall()}
+                q_extra = f"""
+                    SELECT a.id, a.code, a.name as article_name, a.unit,
+                           COALESCE(ra.price_ttc, a.price_ttc) as price_ttc,
+                           c.name as category_name
+                    FROM articles a
+                    LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                    LEFT JOIN categories c ON a.category_id = c.id
+                    WHERE a.id IN ({','.join(['?']*len(unallocated_art_ids))})
+                """
+                extra_arts = {a["id"]: a for a in conn.execute(q_extra, [r_id] + unallocated_art_ids).fetchall()}
                 for aid in unallocated_art_ids:
                     a_info = extra_arts.get(aid)
                     if not a_info:
                         continue
                     actual = sup_map[aid]
                     act_q = actual["qty"]
-                    act_a = actual["amt"]
-                    if act_q <= 0 and act_a <= 0:
+                    act_a_raw = actual["amt"]
+                    if act_q <= 0 and act_a_raw <= 0:
                         continue
-                    p = a_info["price_ttc"] or (act_a / act_q if act_q > 0 else 0.0)
+                    p = round(float(a_info["price_ttc"] or 0.0), 2)
+                    if p <= 0 and act_q > 0:
+                        p = round(float(act_a_raw / act_q), 2)
+                    act_a = round(act_q * p, 2)
 
                     c_lot = a_info["category_name"] if ("category_name" in a_info.keys() and a_info["category_name"]) else "حصة المواد الغذائية الموردة"
                     if lot_name and lot_name != "ALL" and c_lot != lot_name:
                         continue
 
                     tot_actual_qty += act_q
-                    tot_actual_amt += act_a
-                    tot_diff_amt_excess += act_a
+                    tot_actual_amt = round(tot_actual_amt + act_a, 2)
+                    tot_diff_qty_excess += act_q
+                    tot_diff_amt_excess = round(tot_diff_amt_excess + act_a, 2)
                     c_supp = "المورد المعتمد"
 
                     item_obj = {
@@ -2203,14 +2233,46 @@ class StockService:
                             "tot_allocated_amt": 0.0,
                             "tot_actual_qty": 0.0,
                             "tot_actual_amt": 0.0,
+                            "tot_diff_qty_excess": 0.0,
+                            "tot_diff_qty_deficit": 0.0,
                             "tot_diff_amt_excess": 0.0,
                             "tot_diff_amt_deficit": 0.0
                         }
                     l_grp = lots_dict[c_lot]
                     l_grp["items"].append(item_obj)
                     l_grp["tot_actual_qty"] += act_q
-                    l_grp["tot_actual_amt"] += act_a
-                    l_grp["tot_diff_amt_excess"] += act_a
+                    l_grp["tot_actual_amt"] = round(l_grp["tot_actual_amt"] + act_a, 2)
+                    l_grp["tot_diff_qty_excess"] += act_q
+                    l_grp["tot_diff_amt_excess"] = round(l_grp["tot_diff_amt_excess"] + act_a, 2)
+
+            # 4. بناء قائمة الحصص الشاملة لملء القائمة المنسدلة بدقة:
+            # الحصص التي بها مدخولات فعلية لهذه الإقامة أولاً، ثم حصص التخصيص، ثم الحصص الرسمية
+            active_lots = [k for k in lots_dict.keys() if k]
+            alloc_lots = [
+                r[0] for r in conn.execute("""
+                    SELECT DISTINCT lot_name FROM supplier_allocations
+                    WHERE lot_name IS NOT NULL AND lot_name != ''
+                    ORDER BY lot_name ASC
+                """).fetchall()
+            ]
+            standard_lots = [
+                "حصة المواد الغذائية",
+                "حصة الحليب و مشتقاته",
+                "حصة الخضر و الفواكه",
+                "حصة الحلويات و الخبز العادي",
+                "حصة مخبوزات وحلويات",
+                "حصة اللحوم الحمراء الطازجة",
+                "حصة اللحوم البيضاء الطازجة",
+                "حصة السمك الطازج",
+                "حصة الماء المعدني 0.5 ل",
+                "حصة الحبوب",
+                "حصة الكاشير والباتي"
+            ]
+            all_lots = []
+            for l_n in active_lots + alloc_lots + standard_lots:
+                if l_n and l_n not in all_lots:
+                    all_lots.append(l_n)
+            dist_lots = all_lots
 
             return {
                 "year": rep_year,
@@ -2225,6 +2287,8 @@ class StockService:
                 "tot_allocated_amt": tot_allocated_amt,
                 "tot_actual_qty": tot_actual_qty,
                 "tot_actual_amt": tot_actual_amt,
+                "tot_diff_qty_excess": tot_diff_qty_excess,
+                "tot_diff_qty_deficit": tot_diff_qty_deficit,
                 "tot_diff_amt_excess": tot_diff_amt_excess,
                 "tot_diff_amt_deficit": tot_diff_amt_deficit
             }

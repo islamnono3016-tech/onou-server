@@ -619,13 +619,8 @@ class ReportGenerator:
                     </td>
                 </tr>
                 <tr>
-                    <td colspan="3" align="center" style="text-align:center; font-size:13pt; font-weight:bold; padding: 1px 0; border:none;">
-                        ورقــة الإسـتـهـلاك اليومـــي
-                    </td>
-                </tr>
-                <tr>
-                    <td colspan="3" align="center" style="text-align:center; font-size:8.5pt; font-weight:bold; padding-bottom:2px; border:none;">
-                        ليـــــوم : {weekday} {d} / {m:02d} / {y}
+                    <td colspan="3" align="center" style="text-align:center; font-size:12.5pt; font-weight:bold; padding: 1px 0; border:none;">
+                        ورقــة الإسـتـهـلاك اليومـــي &nbsp;&nbsp;&nbsp;&nbsp; ليـــــوم : {weekday} {d} / {m:02d} / {y}
                     </td>
                 </tr>
             </table>
@@ -1638,8 +1633,8 @@ class ReportGenerator:
                 <tr style="font-weight:bold; background:#FFFFFF;">
                     <td align="right" style="border:1px solid #000000; text-align:right; color:#DC2626; white-space:nowrap; padding:3px 4px; font-weight:bold;">{lot['tot_diff_amt_deficit']:,.2f}</td>
                     <td align="right" style="border:1px solid #000000; text-align:right; color:#16A34A; white-space:nowrap; padding:3px 4px; font-weight:bold;">{lot['tot_diff_amt_excess']:,.2f}</td>
-                    <td align="center" style="border:1px solid #000000; text-align:center; white-space:nowrap; padding:3px 4px; font-weight:bold;">0</td>
-                    <td align="center" style="border:1px solid #000000; text-align:center; white-space:nowrap; padding:3px 4px; font-weight:bold;">0</td>
+                    <td align="center" style="border:1px solid #000000; text-align:center; white-space:nowrap; padding:3px 4px; font-weight:bold; color:#DC2626;">{lot.get('tot_diff_qty_deficit', 0):g}</td>
+                    <td align="center" style="border:1px solid #000000; text-align:center; white-space:nowrap; padding:3px 4px; font-weight:bold; color:#16A34A;">{lot.get('tot_diff_qty_excess', 0):g}</td>
                     <td align="right" style="border:1px solid #000000; text-align:right; font-weight:bold; white-space:nowrap; padding:3px 4px;">{lot['tot_actual_amt']:,.2f}</td>
                     <td align="center" style="border:1px solid #000000; text-align:center; white-space:nowrap; padding:3px 4px; font-weight:bold;">{lot['tot_actual_qty']:g}</td>
                     <td align="right" style="border:1px solid #000000; text-align:right; white-space:nowrap; padding:3px 4px; font-weight:bold;">{lot['tot_allocated_amt']:,.2f}</td>
@@ -2028,8 +2023,8 @@ class ReportGenerator:
             ws.cell(row_idx, 6, lot["tot_allocated_amt"]).number_format = "#,##0.00"
             ws.cell(row_idx, 7, lot["tot_actual_qty"]).number_format = "0"
             ws.cell(row_idx, 8, lot["tot_actual_amt"]).number_format = "#,##0.00"
-            ws.cell(row_idx, 9, 0)
-            ws.cell(row_idx, 10, 0)
+            c9 = ws.cell(row_idx, 9, lot.get("tot_diff_qty_excess", 0)); c9.number_format = "0"
+            c10 = ws.cell(row_idx, 10, lot.get("tot_diff_qty_deficit", 0)); c10.number_format = "0"
             ws.cell(row_idx, 11, lot["tot_diff_amt_excess"]).number_format = "#,##0.00"
             ws.cell(row_idx, 12, lot["tot_diff_amt_deficit"]).number_format = "#,##0.00"
 
