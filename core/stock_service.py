@@ -55,6 +55,11 @@ class StockService:
                         sync_s.push_pending(residence_id=r_id)
                     except Exception:
                         pass
+                    try:
+                        # رفع الحزمة الكاملة للإقامة لضمان وصول جميع الأيام المحفوظة مع كافة الأيام السابقة فوراً للسحابة
+                        sync_s.push_full_residence_data(residence_id=r_id)
+                    except Exception:
+                        pass
                 threading.Thread(target=_instant_push, daemon=True).start()
         except Exception:
             pass

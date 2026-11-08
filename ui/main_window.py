@@ -294,6 +294,48 @@ class MainWindow(QMainWindow):
             self.btn_sync_all_residences.clicked.connect(self.on_sync_all_residences_clicked)
             hb_layout.addWidget(self.btn_sync_all_residences)
 
+            self.btn_live_cloud_refresh = QPushButton("☁️ قراءة الإقامة من السحابة")
+            self.btn_live_cloud_refresh.setObjectName("BtnLiveCloudRefresh")
+            self.btn_live_cloud_refresh.setToolTip("قراءة وتحديث أحدث بيانات الإقامة المحددة مباشرة من السحابة فورياً")
+            self.btn_live_cloud_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_live_cloud_refresh.setStyleSheet("""
+                QPushButton#BtnLiveCloudRefresh {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0284C7, stop:1 #38BDF8);
+                    color: #FFFFFF;
+                    font-size: 11px;
+                    font-weight: bold;
+                    border-radius: 6px;
+                    padding: 6px 12px;
+                    border: 1px solid #7DD3FC;
+                }
+                QPushButton#BtnLiveCloudRefresh:hover {
+                    background: #0369A1;
+                }
+            """)
+            self.btn_live_cloud_refresh.clicked.connect(self.on_live_cloud_refresh_clicked)
+            hb_layout.addWidget(self.btn_live_cloud_refresh)
+        else:
+            self.btn_residence_cloud_pull = QPushButton("☁️ سحب كافة الأيام من السحابة 📥")
+            self.btn_residence_cloud_pull.setObjectName("BtnResidenceCloudPull")
+            self.btn_residence_cloud_pull.setToolTip("سحب واسترجاع كافة بيانات وأيام هذه الإقامة مباشرة من السحابة بنقرة واحدة")
+            self.btn_residence_cloud_pull.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_residence_cloud_pull.setStyleSheet("""
+                QPushButton#BtnResidenceCloudPull {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #10B981);
+                    color: #FFFFFF;
+                    font-size: 11px;
+                    font-weight: bold;
+                    border-radius: 6px;
+                    padding: 6px 12px;
+                    border: 1px solid #34D399;
+                }
+                QPushButton#BtnResidenceCloudPull:hover {
+                    background: #047857;
+                }
+            """)
+            self.btn_residence_cloud_pull.clicked.connect(self.on_residence_cloud_pull_clicked)
+            hb_layout.addWidget(self.btn_residence_cloud_pull)
+
         hb_layout.addStretch()
 
         # معلومات المستخدم وشارة الدور
@@ -697,6 +739,21 @@ class MainWindow(QMainWindow):
         self.load_page_data(curr_idx)
         self.dirty_pages.discard(curr_idx)
 
+        if self.is_directorate_session():
+            import threading
+            def _live_pull():
+                try:
+                    from core.sync_service import SyncService
+                    sync_s = SyncService(self.db)
+                    if sync_s.is_server_reachable():
+                        res = sync_s.pull_full_residence_data(r_id)
+                        if res.get("success"):
+                            from PyQt6.QtCore import QMetaObject, Qt
+                            QMetaObject.invokeMethod(self, "_on_live_pull_complete", Qt.ConnectionType.QueuedConnection)
+                except Exception:
+                    pass
+            threading.Thread(target=_live_pull, daemon=True).start()
+
     def on_switch_to_loans(self):
         is_admin = self.is_directorate_session()
         offset = 1 if is_admin else 0
@@ -939,6 +996,136 @@ class MainWindow(QMainWindow):
 
         return AppConfig.get("app_mode") == "DIRECTORATE_SERVER"
 
+
+    def on_live_cloud_refresh_clicked(self):
+        """قراءة أحدث بيانات الإقامة المحددة في المديرية مباشرة من السحابة"""
+        from PyQt6.QtWidgets import QMessageBox, QProgressDialog
+        from PyQt6.QtCore import Qt
+        from core.sync_service import SyncService
+
+        r_id = self.current_residence_id
+        r_name = self.current_residence_name
+        sync_s = SyncService(self.db)
+
+        if not sync_s.is_server_reachable():
+            QMessageBox.warning(
+                self, "لا يوجد اتصال بالسحابة ☁️",
+                "تعذر الاتصال بالخادم السحابي للمديرية.\nيرجى التأكد من توفر شبكة الإنترنت والمحاولة مجدداً."
+            )
+            return
+
+        prog = QProgressDialog(f"جاري قراءة أحدث بيانات ({r_name}) مباشرة من السحابة...", None, 0, 0, self)
+        prog.setWindowTitle("قراءة السحابة المباشرة")
+        prog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        prog.setCancelButton(None)
+        prog.show()
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        try:
+            res = sync_s.pull_full_residence_data(r_id)
+            prog.close()
+
+            if res.get("success"):
+                counts = res.get("counts", {})
+                m_cnt = counts.get("daily_meals_tracking", 0)
+                self.dirty_pages = set(range(self.stack.count()))
+                curr_idx = self.stack.currentIndex()
+                self.load_page_data(curr_idx)
+                self.dirty_pages.discard(curr_idx)
+
+                QMessageBox.information(
+                    self, "تمت القراءة بنجاح ☁️",
+                    f"تمت قراءة وتحديث أحدث بيانات ({r_name}) مباشرة من السحابة!\n\n"
+                    f"• عدد وجبات الأيام المسجلة: {m_cnt} وجبة\n"
+                    f"• وصولات الاستلام (الدخول): {counts.get('entry_vouchers', 0)}\n"
+                    f"• وصولات الصرف (الخروج): {counts.get('exit_vouchers', 0)}\n"
+                    f"• سجل حركات المخزون: {counts.get('stock_movements', 0)}"
+                )
+            else:
+                QMessageBox.critical(
+                    self, "خطأ في القراءة",
+                    f"تعذر استرجاع البيانات من السحابة:\n{res.get('error', 'خطأ غير معروف')}"
+                )
+        except Exception as e:
+            prog.close()
+            QMessageBox.critical(self, "خطأ غير متوقع", f"حدث خطأ أثناء القراءة من السحابة:\n{e}")
+
+    def on_residence_cloud_pull_clicked(self):
+        """سحب واسترجاع كافة بيانات وأيام هذه الإقامة من السحابة بضغطة زر"""
+        from PyQt6.QtWidgets import QMessageBox, QProgressDialog
+        from PyQt6.QtCore import Qt
+        from core.sync_service import SyncService
+
+        r_id = self.current_residence_id
+        r_name = self.current_residence_name
+        sync_s = SyncService(self.db)
+
+        if not sync_s.is_server_reachable():
+            QMessageBox.warning(
+                self, "لا يوجد اتصال بالسحابة ☁️",
+                "تعذر الاتصال بالخادم السحابي للمديرية.\nيرجى التأكد من توفر شبكة الإنترنت والمحاولة مجدداً."
+            )
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "سحب كافة الأيام من السحابة",
+            f"هل تريد سحب وتنزيل كافة بيانات وأيام ({r_name}) من السحابة إلى قاعدة بيانات هذا الحاسوب؟\n\n"
+            f"ملاحظة: هذا الخيار مخصص لمزامنة الحاسوب الجديد وتنزيل كافة السجلات المرفوعة مسبقاً في السحابة.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        prog = QProgressDialog(f"جاري سحب كافة أيام وبيانات ({r_name}) من السحابة...", None, 0, 0, self)
+        prog.setWindowTitle("سحب بيانات السحابة")
+        prog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        prog.setCancelButton(None)
+        prog.show()
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        try:
+            res = sync_s.pull_full_residence_data(r_id)
+            prog.close()
+
+            if res.get("success"):
+                counts = res.get("counts", {})
+                m_cnt = counts.get("daily_meals_tracking", 0)
+                self.dirty_pages = set(range(self.stack.count()))
+                curr_idx = self.stack.currentIndex()
+                self.load_page_data(curr_idx)
+                self.dirty_pages.discard(curr_idx)
+
+                QMessageBox.information(
+                    self, "نجاح سحب البيانات ☁️",
+                    f"تم سحب وتثبيت كافة بيانات وأيام ({r_name}) بنجاح في قاعدة البيانات!\n\n"
+                    f"• عدد وجبات الأيام المسحوبة: {m_cnt} وجبة\n"
+                    f"• وصولات الاستلام (الدخول): {counts.get('entry_vouchers', 0)}\n"
+                    f"• وصولات الصرف (الخروج): {counts.get('exit_vouchers', 0)}\n"
+                    f"• سجل حركات المخزون: {counts.get('stock_movements', 0)}\n\n"
+                    f"أصبح هذا الحاسوب متزامناً بالكامل 100% مع الحاسوب الأول والسحابة."
+                )
+            else:
+                QMessageBox.critical(
+                    self, "خطأ في السحب",
+                    f"تعذر استرجاع البيانات من السحابة:\n{res.get('error', 'خطأ غير معروف')}"
+                )
+        except Exception as e:
+            prog.close()
+            QMessageBox.critical(self, "خطأ غير متوقع", f"حدث خطأ أثناء السحب:\n{e}")
+
+    def _on_live_pull_complete(self):
+        """تحديث الشاشة المعروضة عند اكتمال السحب الخلفي في المديرية"""
+        try:
+            self.dirty_pages = set(range(self.stack.count()))
+            curr_idx = self.stack.currentIndex()
+            self.load_page_data(curr_idx)
+            self.dirty_pages.discard(curr_idx)
+        except Exception:
+            pass
 
     def on_sync_all_residences_clicked(self):
         """مزامنة وتحديث كافة الإقامات التسع للمديرية دفعة واحدة"""

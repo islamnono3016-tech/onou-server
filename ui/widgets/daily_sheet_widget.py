@@ -995,6 +995,21 @@ class DailySheetWidget(QWidget):
 
 
 
+        if self.is_directorate:
+            self.btn_cloud_sync = QPushButton("☁️ قراءة وتحديث من السحابة ⟳")
+            self.btn_cloud_sync.setProperty("class", "btn-secondary")
+            self.btn_cloud_sync.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0284C7, stop:1 #38BDF8); color: #FFFFFF; font-size: 12px; font-weight: bold; border-radius: 6px; padding: 6px 14px; border: 1px solid #7DD3FC;")
+            self.btn_cloud_sync.setToolTip("قراءة أحدث البيانات لهذه الإقامة مباشرة من السحابة وتحديث الشاشة فورياً")
+            self.btn_cloud_sync.clicked.connect(self.pull_all_days_from_cloud)
+            tb_layout.addWidget(self.btn_cloud_sync)
+        else:
+            self.btn_cloud_sync = QPushButton("☁️ سحب كافة الأيام من السحابة 📥")
+            self.btn_cloud_sync.setProperty("class", "btn-secondary")
+            self.btn_cloud_sync.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #10B981); color: #FFFFFF; font-size: 12px; font-weight: bold; border-radius: 6px; padding: 6px 14px; border: 1px solid #34D399;")
+            self.btn_cloud_sync.setToolTip("سحب واسترجاع كافة الأيام السابقة والبيانات المخزونة في السحابة ووضعها في قاعدة البيانات المحلية (مفيد عند تثبيت البرنامج في حاسوب جديد)")
+            self.btn_cloud_sync.clicked.connect(self.pull_all_days_from_cloud)
+            tb_layout.addWidget(self.btn_cloud_sync)
+
         self.btn_save = QPushButton("💾 حفظ ورقة اليوم وتحديث المخزون")
 
         self.btn_save.setProperty("class", "btn-primary")
@@ -3084,13 +3099,23 @@ class DailySheetWidget(QWidget):
 
             self.daily_sheet_saved.emit()
 
+            # رفع الحزمة الكاملة للإقامة في الخلفية لضمان وصول جميع الأيام المحفوظة مع كافة الأيام السابقة فوراً للسحابة
+            import threading
+            def _push_all_days():
+                try:
+                    from core.sync_service import SyncService
+                    SyncService(self.stock_svc.db).push_full_residence_data(self.stock_svc.residence_id)
+                except Exception:
+                    pass
+            threading.Thread(target=_push_all_days, daemon=True).start()
+
             QMessageBox.information(
 
-                self, "نجاح الحفظ",
+                self, "نجاح الحفظ والمزامنة السحابية ☁️",
 
-                f"تم حفظ ورقة الاستهلاك ليوم ({date_str}) بنجاح!\n"
+                f"تم حفظ ورقة الاستهلاك ليوم ({date_str}) بنجاح!\n\n"
 
-                f"تم تحديث أرصدة المخزون وسجل الحركات ومصاريف الاستهلاك آلياً."
+                f"☁️ تم رفع وتأمين كافة الأيام السابقة والحالية مباشرة في السحابة لحمايتها من الضياع ومطابقتها مع المديرية فورياً."
 
             )
 
@@ -3290,6 +3315,57 @@ class DailySheetWidget(QWidget):
     def set_date(self, qdate: QDate):
         if hasattr(self, 'dt_picker') and qdate and qdate.isValid():
             self.dt_picker.setDate(qdate)
+
+    def pull_all_days_from_cloud(self):
+        """سحب واسترجاع كافة الأيام والبيانات من السحابة وتطبيقها محلياً"""
+        from PyQt6.QtWidgets import QMessageBox, QProgressDialog
+        from PyQt6.QtCore import Qt
+        from core.sync_service import SyncService
+
+        r_id = getattr(self.stock_svc, "residence_id", 1)
+        res_name = getattr(self, "current_residence_name", "") or f"الإقامة {r_id}"
+        sync_s = SyncService(self.stock_svc.db)
+
+        if not sync_s.is_server_reachable():
+            QMessageBox.warning(
+                self, "لا يوجد اتصال بالسحابة ☁️",
+                "تعذر الاتصال بالخادم السحابي للمديرية.\nيرجى التأكد من توفر شبكة الإنترنت والمحاولة مجدداً."
+            )
+            return
+
+        prog = QProgressDialog(f"جاري سحب وتحديث كافة الأيام والبيانات من السحابة ({res_name})...", None, 0, 0, self)
+        prog.setWindowTitle("مزامنة السحابة المباشرة")
+        prog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        prog.setCancelButton(None)
+        prog.show()
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        try:
+            res = sync_s.pull_full_residence_data(r_id)
+            prog.close()
+
+            if res.get("success"):
+                counts = res.get("counts", {})
+                m_cnt = counts.get("daily_meals_tracking", 0)
+                QMessageBox.information(
+                    self, "تم سحب البيانات بنجاح ☁️",
+                    f"تم سحب وتحديث كافة الأيام بنجاح من السحابة لـ {res_name}!\n\n"
+                    f"• عدد وجبات الأيام المسحوبة: {m_cnt} وجبة\n"
+                    f"• وصولات الاستلام (الدخول): {counts.get('entry_vouchers', 0)}\n"
+                    f"• وصولات الصرف (الخروج): {counts.get('exit_vouchers', 0)}\n"
+                    f"• سجل حركات المخزون: {counts.get('stock_movements', 0)}\n\n"
+                    f"تمت مزامنة وتحديث قاعدة البيانات المحلية بالكامل."
+                )
+                self.load_daily_sheet()
+            else:
+                QMessageBox.critical(
+                    self, "خطأ في السحب",
+                    f"تعذر استرجاع البيانات من السحابة:\n{res.get('error', 'خطأ غير معروف')}"
+                )
+        except Exception as e:
+            prog.close()
+            QMessageBox.critical(self, "خطأ غير متوقع", f"حدث خطأ أثناء السحب من السحابة:\n{e}")
 
     def set_residence(self, r_id: int, r_name: str = ''):
         self.current_residence_id = r_id

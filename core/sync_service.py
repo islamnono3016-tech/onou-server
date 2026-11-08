@@ -9,7 +9,23 @@ import datetime
 from typing import Optional, Dict, Any, List, Tuple
 import requests
 
-from PyQt6.QtCore import QThread, pyqtSignal, QMutex
+try:
+    from PyQt6.QtCore import QThread, pyqtSignal, QMutex
+except (ImportError, Exception):
+    class QThread:
+        def __init__(self, parent=None): pass
+        def start(self): pass
+        def wait(self): pass
+        def isRunning(self): return False
+        def msleep(self, ms): pass
+    def pyqtSignal(*args, **kwargs):
+        class _DummySignal:
+            def connect(self, slot): pass
+            def emit(self, *a, **k): pass
+        return _DummySignal()
+    class QMutex:
+        def lock(self): pass
+        def unlock(self): pass
 
 from database.db_manager import DatabaseManager
 from core.config import AppConfig
@@ -347,7 +363,20 @@ class SyncService:
         تطبيق وحفظ الحزمة الكاملة لبيانات إقامة محددة حصراً داخل قاعدة البيانات المحلية.
         يضمن العزل التام: لا يمس أي إقامة أخرى إطلاقاً!
         """
+        if not data:
+            return {}
+
         with self.db.get_connection() as conn:
+            # صمام أمان لمنع مسح البيانات المحلية إذا كانت البيانات القادمة من السيرفر فارغة تماماً
+            incoming_meals = len(data.get("daily_meals_tracking", []))
+            incoming_exit = len(data.get("exit_vouchers", []))
+            incoming_entry = len(data.get("entry_vouchers", []))
+            if incoming_meals == 0 and incoming_exit == 0 and incoming_entry == 0:
+                local_meals = conn.execute("SELECT COUNT(*) FROM daily_meals_tracking WHERE residence_id = ?", (residence_id,)).fetchone()[0]
+                local_exit = conn.execute("SELECT COUNT(*) FROM exit_vouchers WHERE residence_id = ?", (residence_id,)).fetchone()[0]
+                if local_meals > 0 or local_exit > 0:
+                    logger.warning(f"Safety Guard: Incoming data for residence {residence_id} is empty (0 records), while local DB has {local_meals} meals. Aborting overwrite to prevent data loss.")
+                    return {"skipped": "empty_incoming"}
             conn.execute("PRAGMA foreign_keys = OFF;")
             try:
                 # 1. تنظيف بيانات هذه الإقامة حصراً
@@ -806,6 +835,19 @@ class SyncService:
                     it_cols = [c[0] for c in cur_it.description] if cur_it.description else []
                     bon_quantities = [dict(zip(it_cols, r)) for r in cur_it.fetchall()]
 
+                # الدليل المرجعي العام (المواد، الممونين، الأصناف) لضمان اتساق كافة الحواسيب
+                cur = conn.execute("SELECT * FROM articles")
+                cols = [c[0] for c in cur.description] if cur.description else []
+                articles_catalog = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                cur = conn.execute("SELECT * FROM suppliers")
+                cols = [c[0] for c in cur.description] if cur.description else []
+                suppliers_catalog = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                cur = conn.execute("SELECT * FROM categories")
+                cols = [c[0] for c in cur.description] if cur.description else []
+                categories_catalog = [dict(zip(cols, r)) for r in cur.fetchall()]
+
             payload = {
                 "residence_id": residence_id,
                 "data": {
@@ -822,7 +864,10 @@ class SyncService:
                     "unlocked_days": unlocked,
                     "supplier_allocations": allocations,
                     "bon_commande": bon_commandes,
-                    "bon_commande_qty": bon_quantities
+                    "bon_commande_qty": bon_quantities,
+                    "articles": articles_catalog,
+                    "suppliers": suppliers_catalog,
+                    "categories": categories_catalog
                 }
             }
 
