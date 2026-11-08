@@ -442,20 +442,6 @@ class GeneralInfoWidget(QWidget):
 
 
 
-        if self.is_directorate:
-            self.btn_cloud_sync = QPushButton("☁️ قراءة وتحديث من السحابة ⟳")
-            self.btn_cloud_sync.setProperty("class", "btn-secondary")
-            self.btn_cloud_sync.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0284C7, stop:1 #38BDF8); color: #FFFFFF; font-size: 12px; font-weight: bold; border-radius: 6px; padding: 6px 14px; border: 1px solid #7DD3FC;")
-            self.btn_cloud_sync.setToolTip("قراءة أحدث البيانات لهذه الإقامة مباشرة من السحابة وتحديث الشاشة فورياً")
-            self.btn_cloud_sync.clicked.connect(self.pull_all_days_from_cloud)
-            tb_layout.addWidget(self.btn_cloud_sync)
-        else:
-            self.btn_cloud_sync = QPushButton("☁️ سحب كافة الأيام من السحابة 📥")
-            self.btn_cloud_sync.setProperty("class", "btn-secondary")
-            self.btn_cloud_sync.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #10B981); color: #FFFFFF; font-size: 12px; font-weight: bold; border-radius: 6px; padding: 6px 14px; border: 1px solid #34D399;")
-            self.btn_cloud_sync.setToolTip("سحب واسترجاع كافة الأيام السابقة والبيانات المخزونة في السحابة ووضعها في قاعدة البيانات المحلية (مفيد عند تثبيت البرنامج في حاسوب جديد)")
-            self.btn_cloud_sync.clicked.connect(self.pull_all_days_from_cloud)
-            tb_layout.addWidget(self.btn_cloud_sync)
 
         self.btn_save = QPushButton("💾 حفظ معلومات عامة")
 
