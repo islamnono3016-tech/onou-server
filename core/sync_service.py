@@ -302,8 +302,8 @@ class SyncService:
                         if not existing:
                             stk.create_exit_voucher(v_obj, payload.get("items", []))
                         applied_count += 1
-                    elif entity_type == "residence_full_push":
-                        # حدث رفع حزمة شاملة من إقامة: سحب وتطبيق حزمة الإقامة المعنية فوراً
+                    elif entity_type in ("residence_full_push", "residence_prices", "prices"):
+                        # حدث رفع حزمة شاملة أو تعديل أسعار من إقامة: سحب وتطبيق حزمة الإقامة المعنية فوراً
                         self.pull_full_residence_data(r_id, base_url=url)
                         applied_count += 1
                 except Exception as ev_err:
@@ -924,9 +924,18 @@ class SyncService:
                     local_entry = conn.execute("SELECT COUNT(*) FROM entry_vouchers WHERE residence_id = ?", (rid,)).fetchone()[0]
                     local_exit = conn.execute("SELECT COUNT(*) FROM exit_vouchers WHERE residence_id = ?", (rid,)).fetchone()[0]
 
-                    if (local_meals < s_info.get("meals", 0) or
-                        local_entry < s_info.get("entry_vouchers", 0) or
-                        local_exit < s_info.get("exit_vouchers", 0)):
+                    local_mv = conn.execute("SELECT COUNT(*) FROM stock_movements WHERE residence_id = ?", (rid,)).fetchone()[0]
+                    local_pr_sum = conn.execute("SELECT COALESCE(SUM(price_ttc), 0.0) FROM residence_articles WHERE residence_id = ?", (rid,)).fetchone()[0]
+                    local_pr_sum = round(float(local_pr_sum), 2)
+
+                    srv_pr_sum = s_info.get("prices_sum")
+                    prices_differ = (srv_pr_sum is not None and abs(local_pr_sum - float(srv_pr_sum)) > 0.01)
+
+                    if (local_meals != s_info.get("meals", 0) or
+                        local_entry != s_info.get("entry_vouchers", 0) or
+                        local_exit != s_info.get("exit_vouchers", 0) or
+                        local_mv != s_info.get("stock_movements", 0) or
+                        prices_differ):
                         out_of_sync.append((rid, s_info.get("name", f"الإقامة {rid}"), local_meals, s_info.get("meals", 0)))
 
             synced_count = 0
@@ -1131,7 +1140,7 @@ class SyncWorker(QThread):
                         # ═══════════════════════════════════════════════════════
                         # 1. التحقق التلقائي الذكي من تطابق كافة الإقامات (Parity Check) عند بدء التشغيل أو بطلب دوري
                         self._dir_cycle_count = getattr(self, "_dir_cycle_count", 0) + 1
-                        if not getattr(self, "_dir_startup_parity_done", False) or self._dir_cycle_count % 30 == 0 or getattr(self, "_force_full_sync", False):
+                        if not getattr(self, "_dir_startup_parity_done", False) or self._dir_cycle_count % 5 == 0 or getattr(self, "_force_full_sync", False):
                             self._dir_startup_parity_done = True
                             self._force_full_sync = False
                             parity_res = self.sync_svc.check_and_enforce_parity()

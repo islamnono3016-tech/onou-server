@@ -2497,9 +2497,21 @@ class StockService:
             conn.commit()
             try:
                 from core.cache_service import CacheService
-                CacheService.invalidate_articles(r_id if "r_id" in locals() else getattr(self, "residence_id", 1))
+                CacheService.invalidate_all()
             except Exception:
                 pass
+
+            import threading
+            def _push_loan_create_async():
+                try:
+                    from core.sync_service import SyncService
+                    s_svc = SyncService(self.db)
+                    s_svc.push_full_residence_data(from_residence_id)
+                    s_svc.push_full_residence_data(to_residence_id)
+                except Exception:
+                    pass
+            threading.Thread(target=_push_loan_create_async, daemon=True).start()
+
             return loan_id
 
     def get_outgoing_loans(
@@ -2770,8 +2782,19 @@ class StockService:
 
         # إبطال الذاكرة المؤقتة للإقامتَين
         from core.cache_service import CacheService
-        CacheService.invalidate_articles(from_res_id)
-        CacheService.invalidate_articles(to_res_id)
+        CacheService.invalidate_all()
+
+        import threading
+        def _push_loan_confirm_async():
+            try:
+                from core.sync_service import SyncService
+                s_svc = SyncService(self.db)
+                s_svc.push_full_residence_data(from_res_id)
+                s_svc.push_full_residence_data(to_res_id)
+            except Exception:
+                pass
+        threading.Thread(target=_push_loan_confirm_async, daemon=True).start()
+
         return True
 
     def cancel_residence_loan(self, loan_id: int, user_name: str = "") -> bool:

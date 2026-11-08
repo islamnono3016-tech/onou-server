@@ -40,6 +40,7 @@ class MainWindow(QMainWindow):
     النافذة الرئيسية لنظام تسيير مخزون الإطعام متعدد الإقامات
     تدعم الإشراف المركزي للمدير العام والتخصيص المستقل لكل إقامة جامعية
     """
+    live_residence_data_pulled = pyqtSignal(int)
 
     def __init__(self, db_manager: DatabaseManager, current_user: Optional[Dict[str, Any]] = None, network_server=None):
         super().__init__()
@@ -56,6 +57,7 @@ class MainWindow(QMainWindow):
 
         self.res_svc = ResidenceService(self.db)
         self.auth_svc = AuthService(self.db)
+        self.live_residence_data_pulled.connect(self._on_live_pull_complete)
 
         # تحديد الإقامة الابتدائية النشطة
         user_res_id = self.current_user.get("residence_id")
@@ -748,8 +750,7 @@ class MainWindow(QMainWindow):
                     if sync_s.is_server_reachable():
                         res = sync_s.pull_full_residence_data(r_id)
                         if res.get("success"):
-                            from PyQt6.QtCore import QMetaObject, Qt
-                            QMetaObject.invokeMethod(self, "_on_live_pull_complete", Qt.ConnectionType.QueuedConnection)
+                            self.live_residence_data_pulled.emit(r_id)
                 except Exception:
                     pass
             threading.Thread(target=_live_pull, daemon=True).start()
@@ -1117,15 +1118,52 @@ class MainWindow(QMainWindow):
             prog.close()
             QMessageBox.critical(self, "خطأ غير متوقع", f"حدث خطأ أثناء السحب:\n{e}")
 
-    def _on_live_pull_complete(self):
+    def _on_live_pull_complete(self, r_id: int = 0):
         """تحديث الشاشة المعروضة عند اكتمال السحب الخلفي في المديرية"""
         try:
-            self.dirty_pages = set(range(self.stack.count()))
-            curr_idx = self.stack.currentIndex()
-            self.load_page_data(curr_idx)
-            self.dirty_pages.discard(curr_idx)
-        except Exception:
-            pass
+            if not r_id or r_id == self.current_residence_id:
+                from core.cache_service import CacheService
+                CacheService.invalidate_all()
+                self.dirty_pages = set(range(self.stack.count()))
+                curr_idx = self.stack.currentIndex()
+                self.load_page_data(curr_idx)
+                self.dirty_pages.discard(curr_idx)
+
+                # تحديث كافة الواجهات فورياً
+                if hasattr(self, "daily_sheet_page"):
+                    try:
+                        self.daily_sheet_page.load_daily_sheet()
+                    except Exception:
+                        pass
+                if hasattr(self, "general_info_page"):
+                    try:
+                        self.general_info_page.load_data()
+                    except Exception:
+                        pass
+                if hasattr(self, "articles_page"):
+                    try:
+                        self.articles_page.load_articles()
+                    except Exception:
+                        pass
+                if hasattr(self, "dashboard_page"):
+                    try:
+                        self.dashboard_page.load_data()
+                    except Exception:
+                        pass
+                if hasattr(self, "matrix_page"):
+                    try:
+                        self.matrix_page.load_current_tab_data()
+                    except Exception:
+                        pass
+                if hasattr(self, "res_manager_page"):
+                    try:
+                        self.res_manager_page.load_data()
+                    except Exception:
+                        pass
+
+                self.status.showMessage(f"🟢 تم سحب وتحديث أحدث بيانات {self.current_residence_name} من السحابة وتحديث الشاشة فورياً", 4000)
+        except Exception as e:
+            logger.warning(f"Notice _on_live_pull_complete: {e}")
 
     def on_sync_all_residences_clicked(self):
         """مزامنة وتحديث كافة الإقامات التسع للمديرية دفعة واحدة"""
@@ -1323,6 +1361,12 @@ class MainWindow(QMainWindow):
                 try:
                     if not getattr(self.general_info_page, "is_dirty", False):
                         self.general_info_page.load_data()
+                except Exception:
+                    pass
+
+            if hasattr(self, "articles_page"):
+                try:
+                    self.articles_page.load_articles()
                 except Exception:
                     pass
 

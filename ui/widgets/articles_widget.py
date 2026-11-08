@@ -879,15 +879,15 @@ class ArticlesWidget(QWidget):
         prog.show()
         QApplication.processEvents()
 
-        result = self.sync_svc.pull_residence_prices(r_id)
+        result = self.sync_svc.pull_full_residence_data(r_id)
         prog.close()
 
         if result.get("success"):
             self.load_articles()
             self.article_saved.emit()
             QMessageBox.information(
-                self, "نجاح سحب الأسعار",
-                f"تم بنجاح سحب وتحديث الأسعار المعتمدة لـ:\n{res_name}\nعدد المواد المحدثة: {result.get('count', 0)}"
+                self, "نجاح سحب وتحديث الأسعار والمواد ☁️",
+                f"تم بنجاح سحب وتحديث الأسعار ودليل المواد والأصناف بالكامل لـ:\n{res_name}\nمن السحابة مباشرة!"
             )
         else:
             QMessageBox.warning(

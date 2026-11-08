@@ -529,6 +529,8 @@ class NetworkServer:
                                 ex_cnt = conn.execute("SELECT COUNT(*) FROM exit_vouchers WHERE residence_id = ?", (rid,)).fetchone()[0]
                                 mv_cnt = conn.execute("SELECT COUNT(*) FROM stock_movements WHERE residence_id = ?", (rid,)).fetchone()[0]
                                 last_m = conn.execute("SELECT MAX(date) FROM daily_meals_tracking WHERE residence_id = ?", (rid,)).fetchone()[0]
+                                pr_cnt = conn.execute("SELECT COUNT(*) FROM residence_articles WHERE residence_id = ?", (rid,)).fetchone()[0]
+                                pr_sum = conn.execute("SELECT COALESCE(SUM(price_ttc), 0.0) FROM residence_articles WHERE residence_id = ?", (rid,)).fetchone()[0]
                                 res_summary[str(rid)] = {
                                     "id": rid,
                                     "name": r["name"],
@@ -536,7 +538,9 @@ class NetworkServer:
                                     "entry_vouchers": en_cnt,
                                     "exit_vouchers": ex_cnt,
                                     "stock_movements": mv_cnt,
-                                    "last_meal_date": last_m
+                                    "last_meal_date": last_m,
+                                    "prices_count": pr_cnt,
+                                    "prices_sum": round(float(pr_sum), 2)
                                 }
                             self._send_json(200, {
                                 "success": True,
@@ -921,6 +925,21 @@ class NetworkServer:
                                         ON CONFLICT(residence_id, article_id) DO UPDATE SET {update_clause}
                                     """
                                     conn.execute(sql, tuple(row[c] for c in cols))
+
+                                # تسجيل حدث مزامنة الأسعار لسحبها تلقائياً وفورياً في المديرية
+                                try:
+                                    r_id = payload.get("residence_id")
+                                    if not r_id and items:
+                                        r_id = items[0].get("residence_id")
+                                    if r_id:
+                                        s_id = f"prices_{r_id}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+                                        conn.execute("""
+                                            INSERT OR IGNORE INTO sync_events (sync_id, residence_id, entity_type, action, entity_id, payload)
+                                            VALUES (?, ?, 'residence_prices', 'UPSERT', ?, ?)
+                                        """, (s_id, int(r_id), str(r_id), json.dumps({"residence_id": int(r_id), "count": len(items)}, ensure_ascii=False)))
+                                except Exception as ev_err:
+                                    logger.warning(f"Notice sync_event logging for prices: {ev_err}")
+
                                 conn.commit()
                             self._send_json(200, {"success": True, "count": len(items)})
                         except Exception as ex_pp:
