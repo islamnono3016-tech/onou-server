@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QStackedWidget, QButtonGroup,
     QStatusBar, QFrame, QComboBox, QMessageBox, QProgressDialog
 )
-from PyQt6.QtCore import Qt, QTimer, QDate, QTime
+from PyQt6.QtCore import Qt, QTimer, QDate, QTime, pyqtSignal, pyqtSlot
 from database.db_manager import DatabaseManager
 import os
 from core.stock_service import StockService
