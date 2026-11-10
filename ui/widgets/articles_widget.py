@@ -476,6 +476,9 @@ class ArticlesWidget(QWidget):
         """استقبال تغيير الإقامة النشطة وضبط عرض أسعارها حصراً"""
         self.current_residence_id = r_id
         self.current_residence_name = r_name
+        self.stock_svc.set_residence(r_id)
+        from core.cache_service import CacheService
+        CacheService.invalidate_articles(r_id)
         self.modified_articles.clear()
         if hasattr(self, "lbl_excel_sub"):
             self.lbl_excel_sub.setText(f"جدول الأسعار التعاقدية والتخفيضات والرسوم - {r_name}")
@@ -487,6 +490,20 @@ class ArticlesWidget(QWidget):
                     break
             self.cmb_residence_filter.blockSignals(False)
         self.load_articles()
+
+        # في وضع المديرية: سحب فوري لأحدث أسعار هذه الإقامة من السحابة في الخلفية لضمان التطابق التام
+        if getattr(self, "is_directorate", False):
+            import threading
+            def _live_pull_prices():
+                try:
+                    if self.sync_svc.is_server_reachable():
+                        r = self.sync_svc.pull_residence_prices(r_id)
+                        if r.get("success") and r.get("count", 0) > 0:
+                            from PyQt6.QtCore import QMetaObject, Qt
+                            QMetaObject.invokeMethod(self, "load_articles", Qt.ConnectionType.QueuedConnection)
+                except Exception:
+                    pass
+            threading.Thread(target=_live_pull_prices, daemon=True).start()
 
     def load_articles(self):
         search = self.txt_search.text().strip()
@@ -702,12 +719,26 @@ class ArticlesWidget(QWidget):
             self.btn_save_changes.setText("💾 حفظ التغييرات")
             self.btn_save_changes.setStyleSheet("background-color: #059669; color: white; font-weight: bold; font-size: 13px; padding: 6px 20px; border-radius: 6px;")
 
-            # مزامنة الأسعار وتكاليف الإقامة المحدثة مع السحابة فوراً في خيط مستقل
+            # مزامنة الأسعار وتكاليف الإقامة المحدثة مع السحابة والمديرية فوراً
             try:
+                with self.stock_svc.db.get_connection() as conn:
+                    cur = conn.execute("SELECT * FROM residence_articles WHERE residence_id = ?", (r_id,))
+                    cols = [c[0] for c in cur.description] if cur.description else []
+                    cur_prices = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                self.sync_svc.enqueue(
+                    residence_id=r_id,
+                    entity_type="residence_prices",
+                    action="UPSERT",
+                    entity_id=f"prices_{r_id}",
+                    payload={"residence_id": r_id, "residence_articles": cur_prices}
+                )
+
                 import threading
                 def _async_cloud_push(target_rid):
                     try:
                         self.sync_svc.push_residence_prices(target_rid)
+                        self.sync_svc.push_pending(target_rid)
                         self.sync_svc.push_full_residence_data(target_rid)
                     except Exception as ex_sync:
                         print(f"Async cloud push after save_all_price_changes notice: {ex_sync}")
@@ -1013,10 +1044,24 @@ class ArticlesWidget(QWidget):
             CacheService.invalidate_all()
 
             try:
+                with self.stock_svc.db.get_connection() as conn:
+                    cur = conn.execute("SELECT * FROM residence_articles WHERE residence_id = ?", (r_id,))
+                    cols = [col[0] for col in cur.description] if cur.description else []
+                    cur_prices = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                self.sync_svc.enqueue(
+                    residence_id=r_id,
+                    entity_type="residence_prices",
+                    action="UPSERT",
+                    entity_id=f"prices_{r_id}",
+                    payload={"residence_id": r_id, "residence_articles": cur_prices}
+                )
+
                 import threading
                 def _sync_import(target_rid):
                     try:
                         self.sync_svc.push_residence_prices(target_rid)
+                        self.sync_svc.push_pending(target_rid)
                         self.sync_svc.push_full_residence_data(target_rid)
                     except Exception:
                         pass

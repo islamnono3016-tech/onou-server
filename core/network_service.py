@@ -851,6 +851,25 @@ class NetworkServer:
                                             existing = conn.execute("SELECT id FROM exit_vouchers WHERE voucher_number = ? AND residence_id = ?", (v_num, item_res_id)).fetchone()
                                     if not existing:
                                         stk.create_exit_voucher(v_obj, data.get("items", []))
+                                elif entity_type in ("residence_prices", "prices"):
+                                    p_items = data.get("residence_articles", [])
+                                    if p_items:
+                                        with db.get_connection() as conn:
+                                            for row in p_items:
+                                                cols = [k for k in row.keys() if k in (
+                                                    "residence_id", "article_id", "price_ht", "discount_rate",
+                                                    "discount_amount", "price_after_discount", "tva_rate", "price_ttc"
+                                                )]
+                                                placeholders = ",".join("?" for _ in cols)
+                                                update_cols = [c for c in cols if c not in ("residence_id", "article_id")]
+                                                update_clause = ",".join(f"{c}=excluded.{c}" for c in update_cols)
+                                                sql = f"""
+                                                    INSERT INTO residence_articles ({','.join(cols)}) VALUES ({placeholders})
+                                                    ON CONFLICT(residence_id, article_id) DO UPDATE SET {update_clause}
+                                                """
+                                                conn.execute(sql, tuple(row[c] for c in cols))
+                                            conn.commit()
+                                        stk.recalculate_residence_costs_from_prices(item_res_id)
                             except Exception as item_err:
                                 logger.warning(f"Notice item sync {sync_id} ({entity_type}): {item_err}")
 
@@ -926,21 +945,31 @@ class NetworkServer:
                                     """
                                     conn.execute(sql, tuple(row[c] for c in cols))
 
-                                # تسجيل حدث مزامنة الأسعار لسحبها تلقائياً وفورياً في المديرية
+                                conn.commit()
+
+                                # إعادة حساب وتحديث تكاليف وصولات الإخراج ووجبات الإقامة بالسيرفر
+                                r_id = payload.get("residence_id")
+                                if not r_id and items:
+                                    r_id = items[0].get("residence_id")
+                                if r_id:
+                                    try:
+                                        from core.stock_service import StockService
+                                        StockService(db, residence_id=int(r_id)).recalculate_residence_costs_from_prices(int(r_id))
+                                    except Exception as ex_rc:
+                                        logger.warning(f"Notice server recalculate costs after prices update: {ex_rc}")
+
+                                # تسجيل حدث مزامنة الأسعار مع تضمين بنود الأسعار في الحمولة لسحبها فوراً في المديرية
                                 try:
-                                    r_id = payload.get("residence_id")
-                                    if not r_id and items:
-                                        r_id = items[0].get("residence_id")
                                     if r_id:
                                         s_id = f"prices_{r_id}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
-                                        conn.execute("""
-                                            INSERT OR IGNORE INTO sync_events (sync_id, residence_id, entity_type, action, entity_id, payload)
-                                            VALUES (?, ?, 'residence_prices', 'UPSERT', ?, ?)
-                                        """, (s_id, int(r_id), str(r_id), json.dumps({"residence_id": int(r_id), "count": len(items)}, ensure_ascii=False)))
+                                        with db.get_connection() as c_ev:
+                                            c_ev.execute("""
+                                                INSERT OR IGNORE INTO sync_events (sync_id, residence_id, entity_type, action, entity_id, payload)
+                                                VALUES (?, ?, 'residence_prices', 'UPSERT', ?, ?)
+                                            """, (s_id, int(r_id), str(r_id), json.dumps({"residence_id": int(r_id), "count": len(items), "residence_articles": items}, ensure_ascii=False)))
+                                            c_ev.commit()
                                 except Exception as ev_err:
                                     logger.warning(f"Notice sync_event logging for prices: {ev_err}")
-
-                                conn.commit()
                             self._send_json(200, {"success": True, "count": len(items)})
                         except Exception as ex_pp:
                             self._send_json(500, {"success": False, "error": str(ex_pp)})

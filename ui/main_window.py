@@ -20,6 +20,7 @@ from reports.report_generator import ReportGenerator
 
 from ui.widgets.dashboard_widget import DashboardWidget
 from ui.widgets.daily_sheet_widget import DailySheetWidget
+from ui.widgets.waste_widget import WasteWidget
 from ui.widgets.general_info_widget import GeneralInfoWidget
 from ui.widgets.residence_loans_widget import ResidenceLoansWidget
 from ui.widgets.articles_widget import ArticlesWidget
@@ -98,6 +99,8 @@ class MainWindow(QMainWindow):
 
         self.loaded_pages = {0}
         self.dirty_pages = set()
+        from core.time_service import TimeService
+        self.current_working_date = TimeService.current_qdate() if TimeService else QDate.currentDate()
         self.sync_svc = SyncService(self.db)
         self.sync_worker = None
         self.backup_svc = BackupService(self.db)
@@ -181,15 +184,16 @@ class MainWindow(QMainWindow):
             ("لوحة القيادة والمؤشرات", 0 + offset),
             ("ورقة الاستهلاك اليومي (01-31)", 1 + offset),
             ("معلومات عامة وتعداد التذاكر 📋", 2 + offset),
-            ("حركة الإعارة والاستعارة بين الإقامات 🔄", 3 + offset),
-            ("قائمة الأسعار ودليل المواد", 4 + offset),
-            ("وصولات الاستلام والتوريد", 5 + offset),
-            ("وصولات الإخراج والتحويلات", 6 + offset),
-            ("شبكات التتبع الشهرية (31 يوم)", 7 + offset),
-            ("وضعية الحصص والموردين (عبد الحميد الوضعية) 📋", 8 + offset),
-            ("مركز السجلات والتقارير والطباعة", 9 + offset),
-            ("📋 بونات الطلب — Bons de Commande", 10 + offset),
-            ("النسخ الاحتياطي والإعدادات", 11 + offset),
+            ("إدارة الإتلاف والمخزون التالف 🗑️", 3 + offset),
+            ("حركة الإعارة والاستعارة بين الإقامات 🔄", 4 + offset),
+            ("قائمة الأسعار ودليل المواد", 5 + offset),
+            ("وصولات الاستلام والتوريد", 6 + offset),
+            ("وصولات الإخراج والتحويلات", 7 + offset),
+            ("شبكات التتبع الشهرية (31 يوم)", 8 + offset),
+            ("وضعية الحصص والموردين (عبد الحميد الوضعية) 📋", 9 + offset),
+            ("مركز السجلات والتقارير والطباعة", 10 + offset),
+            ("📋 بونات الطلب — Bons de Commande", 11 + offset),
+            ("النسخ الاحتياطي والإعدادات", 12 + offset),
         ]
         nav_items.extend(operational_items)
 
@@ -431,21 +435,42 @@ class MainWindow(QMainWindow):
             current_user=self.current_user
         )
         self.daily_sheet_page.daily_sheet_saved.connect(self.mark_pages_dirty)
+        if hasattr(self.daily_sheet_page, "date_changed"):
+            self.daily_sheet_page.date_changed.connect(self.on_working_date_changed)
+
         self.general_info_page = GeneralInfoWidget(
             self.stock_svc, self.meals_svc, self.report_gen,
             is_directorate=is_admin,
             current_user=self.current_user
         )
         self.general_info_page.general_info_saved.connect(self.mark_pages_dirty)
+        if hasattr(self.general_info_page, "date_changed"):
+            self.general_info_page.date_changed.connect(self.on_working_date_changed)
+
+        self.waste_page = WasteWidget(
+            stock_service=self.stock_svc,
+            report_generator=self.report_gen,
+            is_directorate=is_admin,
+            parent=self
+        )
+        self.waste_page.waste_saved.connect(self.mark_pages_dirty)
+        if hasattr(self.waste_page, "date_changed"):
+            self.waste_page.date_changed.connect(self.on_working_date_changed)
 
         self.loans_page = ResidenceLoansWidget(self.stock_svc, current_user=self.current_user)
         self.loans_page.loan_saved.connect(self.mark_pages_dirty)
         self.loans_page.loan_confirmed.connect(self.on_loan_confirmed)
+        if hasattr(self.loans_page, "open_daily_sheet_requested"):
+            self.loans_page.open_daily_sheet_requested.connect(self.on_switch_to_daily_sheet)
 
         # ربط التنقل السريع بين ورقة الاستهلاك ومعلومات عامة وحركة الإعارة
         self.daily_sheet_page.open_general_info_requested.connect(self.on_switch_to_general_info)
+        self.daily_sheet_page.open_waste_requested.connect(self.on_switch_to_waste)
         self.daily_sheet_page.open_loans_requested.connect(self.on_switch_to_loans)
         self.general_info_page.open_daily_sheet_requested.connect(self.on_switch_to_daily_sheet)
+        self.general_info_page.open_waste_requested.connect(self.on_switch_to_waste)
+        self.waste_page.open_daily_sheet_requested.connect(self.on_switch_to_daily_sheet)
+        self.waste_page.open_general_info_requested.connect(self.on_switch_to_general_info)
 
         self.articles_page = ArticlesWidget(self.stock_svc, is_directorate=is_admin)
         self.articles_page.article_saved.connect(self.on_articles_prices_saved)
@@ -476,15 +501,16 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.dashboard_page)       # 0 + offset
         self.stack.addWidget(self.daily_sheet_page)     # 1 + offset
         self.stack.addWidget(self.general_info_page)    # 2 + offset
-        self.stack.addWidget(self.loans_page)           # 3 + offset
-        self.stack.addWidget(self.articles_page)        # 4 + offset
-        self.stack.addWidget(self.entry_page)           # 5 + offset
-        self.stack.addWidget(self.exit_page)            # 6 + offset
-        self.stack.addWidget(self.matrix_page)          # 7 + offset
-        self.stack.addWidget(self.trimester_page)       # 8 + offset
-        self.stack.addWidget(self.reports_page)         # 9 + offset
-        self.stack.addWidget(self.bon_commande_page)    # 10 + offset
-        self.stack.addWidget(self.settings_page)        # 11 + offset
+        self.stack.addWidget(self.waste_page)           # 3 + offset
+        self.stack.addWidget(self.loans_page)           # 4 + offset
+        self.stack.addWidget(self.articles_page)        # 5 + offset
+        self.stack.addWidget(self.entry_page)           # 6 + offset
+        self.stack.addWidget(self.exit_page)            # 7 + offset
+        self.stack.addWidget(self.matrix_page)          # 8 + offset
+        self.stack.addWidget(self.trimester_page)       # 9 + offset
+        self.stack.addWidget(self.reports_page)         # 10 + offset
+        self.stack.addWidget(self.bon_commande_page)    # 11 + offset
+        self.stack.addWidget(self.settings_page)        # 12 + offset
 
         content_layout.addWidget(self.stack)
         main_layout.addWidget(content_container)
@@ -639,7 +665,7 @@ class MainWindow(QMainWindow):
         self.update_theme_button_ui()
 
         # إشعار كافة الصفحات بالتبديل لإعادة رسم الجداول والعناصر الخاصة بتباين فائق
-        for p_name in ["daily_sheet_page", "general_info_page", "articles_page", "matrix_page", "trimester_page"]:
+        for p_name in ["daily_sheet_page", "general_info_page", "waste_page", "articles_page", "matrix_page", "trimester_page"]:
             if hasattr(self, p_name):
                 p = getattr(self, p_name)
                 if hasattr(p, "refresh_theme"):
@@ -717,6 +743,8 @@ class MainWindow(QMainWindow):
             self.exit_page.set_residence(r_id)
         if hasattr(self, "daily_sheet_page"):
             self.daily_sheet_page.set_residence(r_id, r_name)
+        if hasattr(self, "waste_page") and hasattr(self.waste_page, "set_residence"):
+            self.waste_page.set_residence(r_id)
         if hasattr(self, "articles_page") and hasattr(self.articles_page, "set_residence"):
             self.articles_page.set_residence(r_id, r_name)
         if hasattr(self, "settings_page") and hasattr(self.settings_page, "set_residence"):
@@ -748,6 +776,7 @@ class MainWindow(QMainWindow):
                     from core.sync_service import SyncService
                     sync_s = SyncService(self.db)
                     if sync_s.is_server_reachable():
+                        sync_s.pull_residence_prices(r_id)
                         res = sync_s.pull_full_residence_data(r_id)
                         if res.get("success"):
                             self.live_residence_data_pulled.emit(r_id)
@@ -758,9 +787,27 @@ class MainWindow(QMainWindow):
     def on_switch_to_loans(self):
         is_admin = self.is_directorate_session()
         offset = 1 if is_admin else 0
-        target = 3 + offset
+        target = 4 + offset
         if hasattr(self, "loans_page"):
             self.loans_page.refresh_all_data()
+        self.switch_page(target)
+        self._restore_nav_button(target)
+
+    def on_switch_to_waste(self, date_str: str):
+        is_admin = self.is_directorate_session()
+        offset = 1 if is_admin else 0
+        target = 3 + offset
+        qd = QDate.fromString(date_str, "yyyy-MM-dd")
+        if qd.isValid():
+            self.current_working_date = qd
+            if hasattr(self, "daily_sheet_page"):
+                self.daily_sheet_page.set_date(qd)
+            if hasattr(self, "general_info_page"):
+                self.general_info_page.set_date(qd)
+            if hasattr(self, "waste_page"):
+                self.waste_page.set_date(qd)
+            if hasattr(self, "waste_page"):
+                self.waste_page.set_date(qd)
         self.switch_page(target)
         self._restore_nav_button(target)
 
@@ -770,13 +817,23 @@ class MainWindow(QMainWindow):
         if hasattr(self, "daily_sheet_page"):
             self.daily_sheet_page.load_daily_sheet()
 
+    def on_working_date_changed(self, qd: QDate):
+        if qd and qd.isValid():
+            self.current_working_date = qd
+
     def on_switch_to_general_info(self, date_str: str):
         is_admin = self.is_directorate_session()
         offset = 1 if is_admin else 0
         target = 2 + offset
-        if hasattr(self, "general_info_page"):
-            self.general_info_page.set_date_from_str(date_str)
-            self.general_info_page.load_data()
+        qd = QDate.fromString(date_str, "yyyy-MM-dd")
+        if qd.isValid():
+            self.current_working_date = qd
+            if hasattr(self, "daily_sheet_page"):
+                self.daily_sheet_page.set_date(qd)
+            if hasattr(self, "general_info_page"):
+                self.general_info_page.set_date(qd)
+            if hasattr(self, "waste_page"):
+                self.waste_page.set_date(qd)
         self.switch_page(target)
         self._restore_nav_button(target)
 
@@ -785,8 +842,14 @@ class MainWindow(QMainWindow):
         offset = 1 if is_admin else 0
         target = 1 + offset
         qd = QDate.fromString(date_str, "yyyy-MM-dd")
-        if qd.isValid() and hasattr(self, "daily_sheet_page"):
-            self.daily_sheet_page.dt_picker.setDate(qd)
+        if qd.isValid():
+            self.current_working_date = qd
+            if hasattr(self, "daily_sheet_page"):
+                self.daily_sheet_page.set_date(qd)
+            if hasattr(self, "general_info_page"):
+                self.general_info_page.set_date(qd)
+            if hasattr(self, "waste_page"):
+                self.waste_page.set_date(qd)
         self.switch_page(target)
         self._restore_nav_button(target)
 
@@ -856,9 +919,28 @@ class MainWindow(QMainWindow):
 
         is_admin = self.is_directorate_session()
         offset = 1 if is_admin else 0
+        daily_idx = 1 + offset
+        info_idx = 2 + offset
+        waste_idx = 3 + offset
+
+        # مزامنة اليوم والتاريخ المختار عند التنقل بين ورقة الاستهلاك والتعداد والإتلاف
+        if index == daily_idx:
+            target_date = getattr(self, "current_working_date", None)
+            if target_date and target_date.isValid() and hasattr(self, "daily_sheet_page"):
+                self.daily_sheet_page.set_date(target_date)
+
+        elif index == info_idx:
+            target_date = getattr(self, "current_working_date", None)
+            if target_date and target_date.isValid() and hasattr(self, "general_info_page"):
+                self.general_info_page.set_date(target_date)
+
+        elif index == waste_idx:
+            target_date = getattr(self, "current_working_date", None)
+            if target_date and target_date.isValid() and hasattr(self, "waste_page"):
+                self.waste_page.set_date(target_date)
 
         # حماية واجهة النسخ الاحتياطي والإعدادات بكود المديرية الموحد
-        if index == (11 + offset):
+        if index == (12 + offset):
             from ui.widgets.directorate_auth_dialog import DirectorateAuthDialog
             if not DirectorateAuthDialog.verify(self, "الدخول إلى واجهة النسخ الاحتياطي والإعدادات", self.db):
                 self._restore_nav_button(curr_idx)
@@ -868,9 +950,16 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(index)
 
         # 2. تحميل البيانات
-        if index == (2 + offset) and hasattr(self, "general_info_page"):
-            self.general_info_page.load_data()
-        elif index == (3 + offset) and hasattr(self, "loans_page"):
+        if index == daily_idx and hasattr(self, "daily_sheet_page"):
+            if not getattr(self.daily_sheet_page, "is_dirty", False):
+                self.daily_sheet_page.load_daily_sheet()
+        elif index == info_idx and hasattr(self, "general_info_page"):
+            if not getattr(self.general_info_page, "is_dirty", False):
+                self.general_info_page.load_data()
+        elif index == waste_idx and hasattr(self, "waste_page"):
+            if not getattr(self.waste_page, "is_dirty", False):
+                self.waste_page.load_data()
+        elif index == (4 + offset) and hasattr(self, "loans_page"):
             self.loans_page.refresh_all_data()
         elif index not in self.loaded_pages or index in self.dirty_pages:
             self.load_page_data(index)
@@ -895,36 +984,39 @@ class MainWindow(QMainWindow):
             if hasattr(self, "general_info_page"):
                 self.general_info_page.load_data()
         elif index == (3 + offset):
+            if hasattr(self, "waste_page"):
+                self.waste_page.load_data()
+        elif index == (4 + offset):
             if hasattr(self, "loans_page"):
                 self.loans_page.refresh_all_data()
-        elif index == (4 + offset):
+        elif index == (5 + offset):
             if hasattr(self, "articles_page"):
                 self.articles_page.load_articles()
-        elif index == (5 + offset):
+        elif index == (6 + offset):
             if hasattr(self, "entry_page"):
                 if hasattr(self.entry_page, "load_vouchers_history"):
                     self.entry_page.load_vouchers_history()
                 elif hasattr(self.entry_page, "load_vouchers"):
                     self.entry_page.load_vouchers()
-        elif index == (6 + offset):
+        elif index == (7 + offset):
             if hasattr(self, "exit_page"):
                 if hasattr(self.exit_page, "load_history"):
                     self.exit_page.load_history()
                 elif hasattr(self.exit_page, "load_vouchers"):
                     self.exit_page.load_vouchers()
-        elif index == (7 + offset):
+        elif index == (8 + offset):
             if hasattr(self, "matrix_page"):
                 self.matrix_page.load_current_tab_data()
-        elif index == (8 + offset):
+        elif index == (9 + offset):
             if hasattr(self, "trimester_page"):
                 self.trimester_page.load_situation()
-        elif index == (9 + offset):
+        elif index == (10 + offset):
             if hasattr(self, "reports_page"):
                 self.reports_page.refresh_current_tab()
-        elif index == (10 + offset):
+        elif index == (11 + offset):
             if hasattr(self, "bon_commande_page"):
                 self.bon_commande_page.refresh()
-        elif index == (11 + offset):
+        elif index == (12 + offset):
             if hasattr(self, "settings_page"):
                 if hasattr(self.settings_page, "load_settings"):
                     self.settings_page.load_settings()
@@ -1411,10 +1503,12 @@ class MainWindow(QMainWindow):
         latest = self.stock_svc.get_latest_active_date(r_id)
         if latest:
             qd = QDate.fromString(latest, "yyyy-MM-dd")
-            if hasattr(self, "daily_sheet_page"):
-                self.daily_sheet_page.set_date(qd)
-            if hasattr(self, "general_info_page"):
-                self.general_info_page.set_date(qd)
+            if qd.isValid():
+                self.current_working_date = qd
+                if hasattr(self, "daily_sheet_page"):
+                    self.daily_sheet_page.set_date(qd)
+                if hasattr(self, "general_info_page"):
+                    self.general_info_page.set_date(qd)
 
         # التبديل فورياً إلى صفحة ورقة الاستهلاك اليومي ليرى المستخدم أوراقه وتذاكره مباشرة
         is_admin = self.is_directorate_session()

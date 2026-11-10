@@ -238,7 +238,7 @@ class StockService:
                              WHERE a.id = stock_movements.article_id),
                             unit_price
                         )
-                    WHERE residence_id = ? AND movement_type IN ('KITCHEN_OUT', 'LOAN_OUT', 'INITIAL')
+                    WHERE residence_id = ? AND movement_type IN ('KITCHEN_OUT', 'LOAN_OUT')
                 """, (r_id,))
 
             conn.commit()
@@ -360,17 +360,9 @@ class StockService:
                         float(data.get("safety_stock", 0.0)), price_ttc,
                         price_ht, discount_rate, discount_amount, price_after_discount, tva_rate, price_ttc
                     ))
-                if initial_stock > 0:
-                    conn.execute("""
-                        INSERT INTO stock_movements (
-                            residence_id, date, article_id, movement_type, voucher_id,
-                            qty_in, qty_out, unit_price, total_value, balance_after
-                        ) VALUES (?, ?, ?, 'INITIAL', NULL, ?, 0, ?, ?, ?)
-                    """, (
-                        r_id,
-                        (TimeService.today_str() if TimeService else datetime.date.today().isoformat()), article_id,
-                        initial_stock, price_ttc, initial_stock * price_ttc, initial_stock
-                    ))
+                # الأرصدة الافتتاحية للمواد تحفظ حصراً في residence_articles و articles
+                # ولا تدرج كحركة في stock_movements منعاً لتكرارها أو مضاعفة الرصيد في الأيام اللاحقة
+                pass
             conn.commit()
             try:
                 from core.cache_service import CacheService
@@ -387,13 +379,27 @@ class StockService:
                 except Exception as ex_rc:
                     logger.warning(f"Notice recalculate_residence_costs_from_prices: {ex_rc}")
 
-            # رفع التحديث إلى السحابة فوراً في خيط مستقل
+            # رفع التحديث إلى السحابة ورتل المزامنة فوراً لتحديث المديرية تلقائياً
             try:
+                with self.db.get_connection() as conn:
+                    cur = conn.execute("SELECT * FROM residence_articles WHERE residence_id = ?", (r_id,))
+                    cols = [c[0] for c in cur.description] if cur.description else []
+                    prices_list = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+                self._enqueue_sync(
+                    "residence_prices",
+                    "UPSERT",
+                    f"prices_{r_id}_{article_id}",
+                    {"residence_id": r_id, "residence_articles": prices_list},
+                    residence_id=r_id
+                )
+
                 import threading
                 def _async_push_price():
                     try:
                         from core.sync_service import SyncService
                         s_svc = SyncService(self.db)
+                        s_svc.push_residence_prices(r_id)
                         s_svc.push_full_residence_data(r_id)
                     except Exception as ex_p:
                         logger.warning(f"Async push after save_article failed: {ex_p}")
@@ -833,11 +839,11 @@ class StockService:
             # حساب رصيد بداية الفترة
             prior_in = conn.execute("""
                 SELECT COALESCE(SUM(qty_in), 0) FROM stock_movements
-                WHERE article_id = ? AND date < ? AND residence_id = ?
+                WHERE article_id = ? AND date < ? AND residence_id = ? AND movement_type != 'INITIAL'
             """, (article_id, start_date_str, r_id)).fetchone()[0]
             prior_out = conn.execute("""
                 SELECT COALESCE(SUM(qty_out), 0) FROM stock_movements
-                WHERE article_id = ? AND date < ? AND residence_id = ?
+                WHERE article_id = ? AND date < ? AND residence_id = ? AND movement_type != 'INITIAL'
             """, (article_id, start_date_str, r_id)).fetchone()[0]
             opening_stock = init_base + prior_in - prior_out
 
@@ -881,6 +887,14 @@ class StockService:
             """, (article_id, start_date_str, end_date_str, r_id))
             k_by_date = {r["date"]: {"bf": r["bf"], "lu": r["lu"], "di": r["di"]} for r in cur_k.fetchall()}
 
+            cur_w = conn.execute("""
+                SELECT date, SUM(quantity) as qty
+                FROM daily_waste_records
+                WHERE article_id = ? AND date BETWEEN ? AND ? AND residence_id = ?
+                GROUP BY date
+            """, (article_id, start_date_str, end_date_str, r_id))
+            waste_by_date = {r["date"]: r["qty"] for r in cur_w.fetchall()}
+
             # بناء جدول الأيام مع تتبع الأرصدة
             running_stock = opening_stock
             daily_rows = []
@@ -902,9 +916,10 @@ class StockService:
                 bf = float(k_data["bf"])
                 lu = float(k_data["lu"])
                 di = float(k_data["di"])
+                waste = float(waste_by_date.get(d_str, 0.0))
 
                 init_stock = running_stock
-                fin_stock = (init_stock + sup + lin) - (bf + lu + di + lout)
+                fin_stock = (init_stock + sup + lin) - (bf + lu + di + lout + waste)
                 running_stock = fin_stock
 
                 tot_sup += sup
@@ -924,6 +939,7 @@ class StockService:
                     "lu_out": lu,
                     "di_out": di,
                     "loan_out": lout,
+                    "waste": waste,
                     "kitchen_out": bf + lu + di,
                     "final_stock": fin_stock
                 })
@@ -1001,7 +1017,7 @@ class StockService:
                            COALESCE(SUM(qty_in), 0) as tot_in,
                            COALESCE(SUM(qty_out), 0) as tot_out
                     FROM stock_movements
-                    WHERE date < ? AND residence_id = ?
+                    WHERE date < ? AND residence_id = ? AND movement_type != 'INITIAL'
                     GROUP BY article_id
                 """, (start_date_str, r_id)).fetchall()
             }
@@ -1015,7 +1031,8 @@ class StockService:
                         COALESCE(SUM(CASE WHEN movement_type = 'SUPPLY_IN' THEN qty_in ELSE 0 END), 0) as sup_qty,
                         COALESCE(SUM(CASE WHEN movement_type = 'LOAN_IN' THEN qty_in ELSE 0 END), 0) as loan_in_qty,
                         COALESCE(SUM(CASE WHEN movement_type IN ('KITCHEN_OUT', 'BREAKFAST_OUT', 'LUNCH_OUT', 'DINNER_OUT') THEN qty_out ELSE 0 END), 0) as cons_qty,
-                        COALESCE(SUM(CASE WHEN movement_type = 'LOAN_OUT' THEN qty_out ELSE 0 END), 0) as loan_out_qty
+                        COALESCE(SUM(CASE WHEN movement_type = 'LOAN_OUT' THEN qty_out ELSE 0 END), 0) as loan_out_qty,
+                        COALESCE(SUM(CASE WHEN movement_type = 'WASTE_OUT' THEN qty_out ELSE 0 END), 0) as waste_qty
                     FROM stock_movements
                     WHERE date BETWEEN ? AND ? AND residence_id = ?
                     GROUP BY article_id
@@ -1034,8 +1051,9 @@ class StockService:
                 loan_in_qty = m_row["loan_in_qty"] if m_row else 0.0
                 cons_qty = m_row["cons_qty"] if m_row else 0.0
                 loan_out_qty = m_row["loan_out_qty"] if m_row else 0.0
+                waste_qty = m_row["waste_qty"] if m_row else 0.0
 
-                final_qty = (init_qty + sup_qty + loan_in_qty) - (cons_qty + loan_out_qty)
+                final_qty = (init_qty + sup_qty + loan_in_qty) - (cons_qty + loan_out_qty + waste_qty)
 
                 p_ttc = round(float(p_ttc or 0.0), 2)
                 inventory_rows.append({
@@ -1054,6 +1072,8 @@ class StockService:
                     "cons_val": round(cons_qty * p_ttc, 2),
                     "loan_out_qty": loan_out_qty,
                     "loan_out_val": round(loan_out_qty * p_ttc, 2),
+                    "waste_qty": waste_qty,
+                    "waste_val": round(waste_qty * p_ttc, 2),
                     "final_qty": final_qty,
                     "final_val": round(final_qty * p_ttc, 2)
                 })
@@ -1225,6 +1245,20 @@ class StockService:
             for r in li_cur.fetchall():
                 loan_in_items[r["article_id"]] = r["total_li"]
 
+            # إتلاف اليوم (WASTE)
+            waste_items = {}
+            waste_meta = {}
+            w_cur = conn.execute("""
+                SELECT article_id, SUM(quantity) as total_waste, MAX(reason) as reason, MAX(notes) as notes
+                FROM daily_waste_records
+                WHERE date = ? AND residence_id = ?
+                GROUP BY article_id
+            """, (date_str, r_id))
+            for r in w_cur.fetchall():
+                art_w_id = r["article_id"]
+                waste_items[art_w_id] = float(r["total_waste"] or 0.0)
+                waste_meta[art_w_id] = {"reason": r["reason"] or "تالف", "notes": r["notes"] or ""}
+
             # حساب مخزون بداية هذا اليوم دفعة واحدة لجميع المواد
             prior_moves = {
                 r["article_id"]: (r["tot_in"] - r["tot_out"])
@@ -1233,7 +1267,7 @@ class StockService:
                            COALESCE(SUM(qty_in), 0) as tot_in,
                            COALESCE(SUM(qty_out), 0) as tot_out
                     FROM stock_movements
-                    WHERE date < ? AND residence_id = ?
+                    WHERE date < ? AND residence_id = ? AND movement_type != 'INITIAL'
                     GROUP BY article_id
                 """, (date_str, r_id)).fetchall()
             }
@@ -1259,8 +1293,9 @@ class StockService:
                 lu_qty = k_info["lu"]
                 di_qty = k_info["di"]
                 lo_qty = loan_out_items.get(art_id, 0.0) + k_info["other"]
+                waste_qty = waste_items.get(art_id, 0.0)
 
-                final_day_stock = initial_day_stock + sup_qty + li_qty - (bf_qty + lu_qty + di_qty + lo_qty)
+                final_day_stock = initial_day_stock + sup_qty + li_qty - (bf_qty + lu_qty + di_qty + lo_qty + waste_qty)
 
                 eff_price = round(float(p_ttc or 0.0), 2)
 
@@ -1286,6 +1321,9 @@ class StockService:
                     "lu_qty": lu_qty,
                     "di_qty": di_qty,
                     "loan_out_qty": lo_qty,
+                    "waste_qty": waste_qty,
+                    "waste_reason": waste_meta.get(art_id, {}).get("reason", "تالف"),
+                    "waste_notes": waste_meta.get(art_id, {}).get("notes", ""),
                     "final_stock": final_day_stock,
                     "cost_bf": cost_bf,
                     "cost_lu": cost_lu,
@@ -1437,7 +1475,8 @@ class StockService:
             lu = float(it.get("lu_qty", 0.0) or 0.0)
             di = float(it.get("di_qty", 0.0) or 0.0)
             lo = float(it.get("loan_out_qty", 0.0) or 0.0)
-            tot_out = bf + lu + di + lo
+            waste = float(it.get("waste_qty", 0.0) or 0.0)
+            tot_out = bf + lu + di + lo + waste
 
             if tot_out > 1e-6 and tot_out > (avail + 1e-6):
                 art_name = it.get("name", f"المادة #{it.get('id')}")
@@ -1570,6 +1609,51 @@ class StockService:
                         VALUES (?, ?, 'LOAN_OUT', ?, ?, 0, ?, ?, ?, 0)
                     """, (date_str, it["id"], lo_id, r_id, q, p, q * p))
 
+            # 2.3 معالجة الإتلاف (WASTE) المسجل في ورقة اليوم
+            waste_items_input = [it for it in articles_input if it.get("waste_qty", 0) > 0]
+            old_waste = conn.execute("""
+                SELECT id FROM exit_vouchers
+                WHERE date = ? AND voucher_type = 'WASTE' AND residence_id = ?
+            """, (date_str, r_id)).fetchall()
+
+            for r in old_waste:
+                conn.execute("DELETE FROM exit_voucher_items WHERE voucher_id = ?", (r["id"],))
+                conn.execute("DELETE FROM exit_vouchers WHERE id = ?", (r["id"],))
+                conn.execute("DELETE FROM stock_movements WHERE voucher_id = ? AND movement_type = 'WASTE_OUT' AND residence_id = ?", (r["id"], r_id))
+
+            prev_waste_recs = {
+                r["article_id"]: (r["reason"], r["notes"])
+                for r in conn.execute("SELECT article_id, reason, notes FROM daily_waste_records WHERE date = ? AND residence_id = ?", (date_str, r_id)).fetchall()
+            }
+            conn.execute("DELETE FROM daily_waste_records WHERE date = ? AND residence_id = ?", (date_str, r_id))
+
+            if waste_items_input:
+                tot_waste_val = sum(float(it.get("waste_qty", 0)) * float(it.get("price_ttc", 0.0) or 0.0) for it in waste_items_input)
+                cur = conn.execute("""
+                    INSERT INTO exit_vouchers (voucher_number, date, voucher_type, residence_id, total_amount, notes)
+                    VALUES (?, ?, 'WASTE', ?, ?, 'إتلاف ورقة اليوم')
+                """, (f"BS-{r_id}-{date_str}-WASTE", date_str, r_id, tot_waste_val))
+                w_id = cur.lastrowid
+                for it in waste_items_input:
+                    q = float(it["waste_qty"])
+                    p = round(float(it.get("price_ttc", 0.0) or 0.0), 2)
+                    t_val = round(q * p, 2)
+                    prev_r, prev_n = prev_waste_recs.get(it["id"], ("تالف", ""))
+                    reason = it.get("waste_reason") or prev_r or "تالف"
+                    notes_w = it.get("waste_notes") or prev_n or ""
+                    conn.execute("""
+                        INSERT INTO exit_voucher_items (voucher_id, article_id, qty_breakfast, qty_lunch, qty_dinner, qty_other, total_qty, unit_price_ttc, total_cost, notes)
+                        VALUES (?, ?, 0, 0, 0, ?, ?, ?, ?, ?)
+                    """, (w_id, it["id"], q, q, p, t_val, notes_w))
+                    conn.execute("""
+                        INSERT INTO stock_movements (date, article_id, movement_type, voucher_id, residence_id, qty_in, qty_out, unit_price, total_value, balance_after)
+                        VALUES (?, ?, 'WASTE_OUT', ?, ?, 0, ?, ?, ?, 0)
+                    """, (date_str, it["id"], w_id, r_id, q, p, t_val))
+                    conn.execute("""
+                        INSERT INTO daily_waste_records (residence_id, date, article_id, quantity, unit_price_ttc, total_value, reason, notes)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (r_id, date_str, it["id"], q, p, t_val, reason, notes_w))
+
             # في يوم 01/09/2026 حصراً: حفظ وتثبيت مخزون أول مدة المسجل يدوياً في عمود (مخزون أول مدة)
             if date_str in ("2026-09-01", "01-09-2026"):
                 for it in articles_input:
@@ -1628,7 +1712,7 @@ class StockService:
                 r["article_id"]: (r["tot_in"], r["tot_out"])
                 for r in conn.execute("""
                     SELECT article_id, COALESCE(SUM(qty_in), 0) as tot_in, COALESCE(SUM(qty_out), 0) as tot_out
-                    FROM stock_movements WHERE residence_id = ? GROUP BY article_id
+                    FROM stock_movements WHERE residence_id = ? AND movement_type != 'INITIAL' GROUP BY article_id
                 """, (r_id,)).fetchall()
             }
             batch_updates = []
@@ -1984,7 +2068,8 @@ class StockService:
                 "total_in": it["supply_qty"] + it["loan_in_qty"],
                 "cons_out": it["cons_qty"],
                 "loan_out": it["loan_out_qty"],
-                "total_out": it["cons_qty"] + it["loan_out_qty"],
+                "waste_out": it.get("waste_qty", 0.0),
+                "total_out": it["cons_qty"] + it["loan_out_qty"] + it.get("waste_qty", 0.0),
                 "final_stock": it["final_qty"],
                 "price_ttc": it["price_ttc"],
                 "final_val": it["final_val"]
@@ -3057,3 +3142,226 @@ class StockService:
                 notes.append(f"تم إعارة {row['quantity']:g} {row['unit']} من مادة {row['article_name']} لفائدة {row['to_res_name']}.")
 
         return notes
+
+    # -------------------------------------------------------------
+    # 11. إدارة الإتلاف والمخزون التالف (Daily Waste & Spoilage)
+    # -------------------------------------------------------------
+    def get_daily_waste_data(self, date_str: str, residence_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        جلب بيانات واجهة الإتلاف ليوم محدد:
+        قائمة المواد مع المخزون المتوفر في هذا اليوم قبل الإتلاف، والكميات المتلفة المسجلة
+        """
+        r_id = residence_id or self.residence_id
+        with self.db.get_connection() as conn:
+            articles = conn.execute("""
+                SELECT a.id, a.code, a.name, a.unit, COALESCE(ra.price_ttc, a.price_ttc) as price_ttc,
+                       COALESCE(ra.current_stock, a.current_stock) as current_stock,
+                       COALESCE(ra.initial_stock, a.initial_stock) as initial_stock
+                FROM articles a
+                LEFT JOIN residence_articles ra ON a.id = ra.article_id AND ra.residence_id = ?
+                WHERE (a.is_active = 1
+                   OR COALESCE(ra.current_stock, a.current_stock) != 0
+                   OR a.id IN (SELECT article_id FROM daily_waste_records WHERE date = ? AND residence_id = ?)
+                )
+                ORDER BY a.id ASC
+            """, (r_id, date_str, r_id)).fetchall()
+
+            prior_moves = {
+                r["article_id"]: (r["tot_in"] - r["tot_out"])
+                for r in conn.execute("""
+                    SELECT article_id,
+                           COALESCE(SUM(qty_in), 0) as tot_in,
+                           COALESCE(SUM(qty_out), 0) as tot_out
+                    FROM stock_movements
+                    WHERE date < ? AND residence_id = ? AND movement_type != 'INITIAL'
+                    GROUP BY article_id
+                """, (date_str, r_id)).fetchall()
+            }
+
+            sup_cur = conn.execute("""
+                SELECT evi.article_id, SUM(evi.quantity) as total_sup
+                FROM entry_voucher_items evi
+                JOIN entry_vouchers ev ON evi.voucher_id = ev.id
+                WHERE ev.date = ? AND ev.voucher_type IN ('SUPPLIER', 'SUPPLY') AND ev.residence_id = ?
+                GROUP BY evi.article_id
+            """, (date_str, r_id)).fetchall()
+            supply_items = {r["article_id"]: r["total_sup"] for r in sup_cur}
+
+            li_cur = conn.execute("""
+                SELECT evi.article_id, SUM(evi.quantity) as total_li
+                FROM entry_voucher_items evi
+                JOIN entry_vouchers ev ON evi.voucher_id = ev.id
+                WHERE ev.date = ? AND ev.voucher_type = 'LOAN_IN' AND ev.residence_id = ?
+                GROUP BY evi.article_id
+            """, (date_str, r_id)).fetchall()
+            loan_in_items = {r["article_id"]: r["total_li"] for r in li_cur}
+
+            k_cur = conn.execute("""
+                SELECT evi.article_id,
+                       SUM(evi.qty_breakfast + evi.qty_lunch + evi.qty_dinner) as total_k,
+                       SUM(evi.qty_other) as total_oth
+                FROM exit_voucher_items evi
+                JOIN exit_vouchers ev ON evi.voucher_id = ev.id
+                WHERE ev.date = ? AND ev.voucher_type = 'KITCHEN' AND ev.residence_id = ?
+                GROUP BY evi.article_id
+            """, (date_str, r_id)).fetchall()
+            kitchen_items = {r["article_id"]: (float(r["total_k"] or 0.0) + float(r["total_oth"] or 0.0)) for r in k_cur}
+
+            lo_cur = conn.execute("""
+                SELECT evi.article_id, SUM(evi.total_qty) as total_lo
+                FROM exit_voucher_items evi
+                JOIN exit_vouchers ev ON evi.voucher_id = ev.id
+                WHERE ev.date = ? AND ev.voucher_type = 'LOAN_OUT' AND ev.residence_id = ?
+                GROUP BY evi.article_id
+            """, (date_str, r_id)).fetchall()
+            loan_out_items = {r["article_id"]: float(r["total_lo"] or 0.0) for r in lo_cur}
+
+            waste_cur = conn.execute("""
+                SELECT article_id, quantity, unit_price_ttc, total_value, reason, notes
+                FROM daily_waste_records
+                WHERE date = ? AND residence_id = ?
+            """, (date_str, r_id)).fetchall()
+            waste_records = {r["article_id"]: dict(r) for r in waste_cur}
+
+            rows = []
+            tot_waste_qty = 0.0
+            tot_waste_value = 0.0
+            wasted_items_count = 0
+
+            for a in articles:
+                art_id = a["id"]
+                p_ttc = round(float(a["price_ttc"] or 0.0), 2)
+                init_base = a["initial_stock"] or 0.0
+                initial_day_stock = init_base + prior_moves.get(art_id, 0.0)
+
+                sup = supply_items.get(art_id, 0.0)
+                li = loan_in_items.get(art_id, 0.0)
+                k_out = kitchen_items.get(art_id, 0.0)
+                lo = loan_out_items.get(art_id, 0.0)
+
+                avail_before_waste = max(0.0, round(initial_day_stock + sup + li - (k_out + lo), 4))
+
+                w_info = waste_records.get(art_id, {})
+                w_qty = float(w_info.get("quantity") or 0.0)
+                w_reason = w_info.get("reason") or "تالف"
+                w_notes = w_info.get("notes") or ""
+                w_val = round(w_qty * p_ttc, 2)
+
+                stock_after_waste = max(0.0, round(avail_before_waste - w_qty, 4))
+
+                if w_qty > 0:
+                    tot_waste_qty += w_qty
+                    tot_waste_value += w_val
+                    wasted_items_count += 1
+
+                rows.append({
+                    "id": art_id,
+                    "code": a["code"] or "",
+                    "name": a["name"],
+                    "unit": a["unit"],
+                    "price_ttc": p_ttc,
+                    "initial_day_stock": initial_day_stock,
+                    "available_stock": avail_before_waste,
+                    "waste_qty": w_qty,
+                    "waste_reason": w_reason,
+                    "waste_notes": w_notes,
+                    "waste_value": w_val,
+                    "stock_after_waste": stock_after_waste
+                })
+
+            return {
+                "date": date_str,
+                "residence_id": r_id,
+                "articles": rows,
+                "tot_waste_qty": round(tot_waste_qty, 2),
+                "tot_waste_value": round(tot_waste_value, 2),
+                "wasted_items_count": wasted_items_count
+            }
+
+    def save_daily_waste(self, date_str: str, waste_items: List[Dict[str, Any]], residence_id: Optional[int] = None, notes: Optional[str] = None) -> None:
+        """
+        حفظ سجل الإتلاف ليوم محدد وخصم الكميات أوتوماتيكياً من المخزون
+        دون المساس بمصاريف وجبات الإطعام
+        """
+        r_id = residence_id or self.residence_id
+        with self.db.get_connection() as conn:
+            for it in waste_items:
+                w_qty = float(it.get("waste_qty", 0.0) or 0.0)
+                if w_qty > 0:
+                    avail = float(it.get("available_stock", 0.0) or 0.0)
+                    if w_qty > (avail + 1e-6):
+                        art_name = it.get("name", f"المادة #{it.get('id')}")
+                        raise InsufficientStockError(art_name, w_qty, avail)
+
+            conn.execute("DELETE FROM daily_waste_records WHERE date = ? AND residence_id = ?", (date_str, r_id))
+
+            old_vouchers = conn.execute("""
+                SELECT id FROM exit_vouchers
+                WHERE date = ? AND voucher_type = 'WASTE' AND residence_id = ?
+            """, (date_str, r_id)).fetchall()
+            for r in old_vouchers:
+                conn.execute("DELETE FROM exit_voucher_items WHERE voucher_id = ?", (r["id"],))
+                conn.execute("DELETE FROM exit_vouchers WHERE id = ?", (r["id"],))
+                conn.execute("DELETE FROM stock_movements WHERE voucher_id = ? AND movement_type = 'WASTE_OUT' AND residence_id = ?", (r["id"], r_id))
+
+            active_waste = [it for it in waste_items if float(it.get("waste_qty", 0.0) or 0.0) > 0]
+            if active_waste:
+                tot_waste_val = sum(round(float(it.get("waste_qty", 0.0) or 0.0) * round(float(it.get("price_ttc", 0.0) or 0.0), 2), 2) for it in active_waste)
+                cur = conn.execute("""
+                    INSERT INTO exit_vouchers (voucher_number, date, voucher_type, residence_id, total_amount, notes)
+                    VALUES (?, ?, 'WASTE', ?, ?, ?)
+                """, (f"BS-{r_id}-{date_str}-WASTE", date_str, r_id, tot_waste_val, notes or "إتلاف مواد منتهية الصلاحية / تالفة"))
+                voucher_id = cur.lastrowid
+
+                for it in active_waste:
+                    art_id = it["id"]
+                    q = float(it["waste_qty"])
+                    p = round(float(it.get("price_ttc", 0.0) or 0.0), 2)
+                    t_val = round(q * p, 2)
+                    reason = it.get("waste_reason", "تالف")
+                    notes_it = it.get("waste_notes", "")
+
+                    conn.execute("""
+                        INSERT INTO daily_waste_records (residence_id, date, article_id, quantity, unit_price_ttc, total_value, reason, notes)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (r_id, date_str, art_id, q, p, t_val, reason, notes_it))
+
+                    conn.execute("""
+                        INSERT INTO exit_voucher_items (voucher_id, article_id, qty_breakfast, qty_lunch, qty_dinner, qty_other, total_qty, unit_price_ttc, total_cost, notes)
+                        VALUES (?, ?, 0, 0, 0, ?, ?, ?, ?, ?)
+                    """, (voucher_id, art_id, q, q, p, t_val, notes_it))
+
+                    conn.execute("""
+                        INSERT INTO stock_movements (date, article_id, movement_type, voucher_id, residence_id, qty_in, qty_out, unit_price, total_value, balance_after)
+                        VALUES (?, ?, 'WASTE_OUT', ?, ?, 0, ?, ?, ?, 0)
+                    """, (date_str, art_id, voucher_id, r_id, q, p, t_val))
+
+            inits_map = {
+                r["article_id"]: r["initial_stock"]
+                for r in conn.execute("SELECT article_id, initial_stock FROM residence_articles WHERE residence_id = ?", (r_id,)).fetchall()
+            }
+            moves_map = {
+                r["article_id"]: (r["tot_in"], r["tot_out"])
+                for r in conn.execute("""
+                    SELECT article_id, COALESCE(SUM(qty_in), 0) as tot_in, COALESCE(SUM(qty_out), 0) as tot_out
+                    FROM stock_movements WHERE residence_id = ? AND movement_type != 'INITIAL' GROUP BY article_id
+                """, (r_id,)).fetchall()
+            }
+            batch_updates = []
+            for it in waste_items:
+                art_id = it["id"]
+                init_stk = inits_map.get(art_id, 0.0)
+                tot_in, tot_out = moves_map.get(art_id, (0.0, 0.0))
+                new_current = init_stk + tot_in - tot_out
+                batch_updates.append((r_id, art_id, init_stk, new_current, 10.0, float(it.get("price_ttc", 0.0) or 0.0)))
+
+            conn.executemany("""
+                INSERT INTO residence_articles (residence_id, article_id, initial_stock, current_stock, safety_stock, current_pmp)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(residence_id, article_id) DO UPDATE SET current_stock = excluded.current_stock
+            """, batch_updates)
+
+            if r_id == 1:
+                conn.executemany("UPDATE articles SET current_stock = ? WHERE id = ?", [(b[3], b[1]) for b in batch_updates])
+
+            conn.commit()

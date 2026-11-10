@@ -302,8 +302,36 @@ class SyncService:
                         if not existing:
                             stk.create_exit_voucher(v_obj, payload.get("items", []))
                         applied_count += 1
-                    elif entity_type in ("residence_full_push", "residence_prices", "prices"):
-                        # حدث رفع حزمة شاملة أو تعديل أسعار من إقامة: سحب وتطبيق حزمة الإقامة المعنية فوراً
+                    elif entity_type in ("residence_prices", "prices"):
+                        # حدث تعديل أسعار من إقامة: تطبيق الأسعار فوراً وتحديث التكاليف للإقامة في المديرية
+                        p_items = payload.get("residence_articles", [])
+                        if p_items:
+                            with self.db.get_connection() as conn:
+                                for row in p_items:
+                                    if 'tva_rate' in row and row['tva_rate'] is not None:
+                                        tva_raw = float(row['tva_rate'])
+                                        row['tva_rate'] = (tva_raw * 100.0) if (0.0 < tva_raw <= 1.0) else tva_raw
+                                    cols = [k for k in row.keys() if k in (
+                                        "residence_id", "article_id", "price_ht", "discount_rate",
+                                        "discount_amount", "price_after_discount", "tva_rate", "price_ttc"
+                                    )]
+                                    placeholders = ",".join("?" for _ in cols)
+                                    update_cols = [c for c in cols if c not in ("residence_id", "article_id")]
+                                    update_clause = ",".join(f"{c}=excluded.{c}" for c in update_cols)
+                                    sql = f"""
+                                        INSERT INTO residence_articles ({','.join(cols)}) VALUES ({placeholders})
+                                        ON CONFLICT(residence_id, article_id) DO UPDATE SET {update_clause}
+                                    """
+                                    conn.execute(sql, tuple(row[c] for c in cols))
+                                conn.commit()
+                        else:
+                            self.pull_residence_prices(r_id, base_url=url)
+
+                        stk.recalculate_residence_costs_from_prices(r_id)
+                        from core.cache_service import CacheService
+                        CacheService.invalidate_articles(r_id)
+                        applied_count += 1
+                    elif entity_type == "residence_full_push":
                         self.pull_full_residence_data(r_id, base_url=url)
                         applied_count += 1
                 except Exception as ev_err:
